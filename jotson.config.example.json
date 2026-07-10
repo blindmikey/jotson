@@ -1,6 +1,7 @@
 {
   "dataDir": "data/json",
   "publicDir": "public",
+  "uploadDir": "uploads",
   "logo": null,
   "logoLight": null,
   "title": "JotSON",

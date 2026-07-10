@@ -4,8 +4,12 @@
 const { createApp } = Vue
 
 const DEFAULT_LABEL_FIELDS = ['title', 'label', 'name', 'id']
+const DEFAULT_ID_FIELDS = ['id']
+const JOTSON_BRAND = '{J𝘰𝓉SON}' // internal branding - not part of the per-project config
 const IMG_RE = /\.(png|jpe?g|webp|gif|svg|avif)(\?.*)?$/i
 const VID_RE = /\.(mp4|webm|mov|ogg)(\?.*)?$/i
+// Local media path (not an http URL): detected as the "file" type, which adds upload support
+const FILE_RE = /^(?!https?:\/\/)[^\n]+\.(png|jpe?g|webp|gif|svg|avif|ico|mp4|webm|mov|ogg|mp3|wav|pdf)(\?.*)?$/i
 const COLOR_RE = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
 const DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/
@@ -27,6 +31,7 @@ function displayType(v) {
   const t = typeOf(v)
   if (t !== 'string') return t
   if (COLOR_RE.test(v)) return 'color'
+  if (FILE_RE.test(v)) return 'file'
   return dateKind(v) || 'string'
 }
 
@@ -327,9 +332,19 @@ createApp({
       unfurl: { url: null, loading: false, data: null },
       unfurlTimer: null,
       inspWidth: Number(localStorage.getItem('cms.inspWidth')) || 360,
-      config: { dataDir: '', publicDir: '', logo: null, logoLight: null, title: '', labelFields: 'title, label, name, id' },
+      config: { dataDir: '', publicDir: '', uploadDir: '', logo: null, logoLight: null, title: '', labelFields: 'title, label, name, id' },
+      jotsonBrand: JOTSON_BRAND,
       configPath: 'jotson.config.json',
-      cfgDraft: { dataDir: '', publicDir: '', logo: '', logoLight: '', title: '', labelFields: '' },
+      version: null,
+      update: null, // { latest, command } when a newer version is on npm
+      uploading: false,
+      fileTypeOverride: null, // "file:path" of a string manually switched to the file type
+      mediaScan: null, // { loading, orphans: [{name,size,mtime}] } - unused-uploads scan state
+      // References: id index across all loaded files, rebuilt lazily after edits
+      refIndex: null, // { targets: Map<id, [{file,path,label,field}]>, referrers: Map<id, [{file,path}]> }
+      refTypeOverride: null, // "file:path" of a string manually switched to the reference type
+      refPicker: { open: false, query: '', collection: null, sel: 0 },
+      cfgDraft: { dataDir: '', publicDir: '', uploadDir: '', logo: '', logoLight: '', title: '', labelFields: '', idFields: '' },
       cfgSaving: false,
       labelFields: DEFAULT_LABEL_FIELDS,
       toasts: [],
@@ -346,6 +361,84 @@ createApp({
     canUndo() {
       const stacks = this.undoStacks[this.active]
       return !!(stacks && stacks.undo.length)
+    },
+
+    canRedo() {
+      const stacks = this.undoStacks[this.active]
+      return !!(stacks && stacks.redo.length)
+    },
+
+    idFieldsList() {
+      return this.config.idFields && this.config.idFields.length ? this.config.idFields : DEFAULT_ID_FIELDS
+    },
+
+    /* The selected node is a string under an idFields key (identity, not reference) */
+    isIdKey() {
+      if (!this.selected || !this.selPath.length) return false
+      const key = this.selPath[this.selPath.length - 1]
+      return typeof key === 'string' && this.idFieldsList.includes(key) && typeof this.selected.value === 'string'
+    },
+
+    /* Target info for the selected reference: resolved targets, broken/ambiguous flags */
+    refInfo() {
+      if (!this.selected || this.selected.type !== 'reference') return null
+      const id = this.selected.value
+      const targets = id ? this.getRefIndex().targets.get(id) || [] : []
+      return { id, targets, broken: !targets.length, ambiguous: targets.length > 1 }
+    },
+
+    /* When an id-bearing object is selected: everything that references it */
+    reverseRefs() {
+      if (!this.selected || typeOf(this.selected.value) !== 'object') return null
+      let id = null
+      for (const f of this.idFieldsList) {
+        const v = this.selected.value[f]
+        if (typeof v === 'string' && v) {
+          id = v
+          break
+        }
+      }
+      if (!id) return null
+      return { id, refs: this.getRefIndex().referrers.get(id) || [] }
+    },
+
+    /* Arrays of id-bearing objects, grouped for the picker's browse view */
+    refCollections() {
+      const groups = new Map()
+      for (const [id, list] of this.getRefIndex().targets) {
+        for (const t of list) {
+          if (typeof t.path[t.path.length - 1] !== 'number') continue // collections are arrays
+          const parent = t.path.slice(0, -1)
+          const key = t.file + '|' + parent.join('.')
+          if (!groups.has(key)) {
+            groups.set(key, { key, file: t.file, label: parent.length ? this.pathLabelOf(parent) : this.shortName(t.file), items: [] })
+          }
+          groups.get(key).items.push({ id, label: t.label, file: t.file, path: t.path, pathLabel: this.pathLabelOf(t.path) })
+        }
+      }
+      return [...groups.values()].sort((a, b) => a.label.localeCompare(b.label))
+    },
+
+    refPickerResults() {
+      if (!this.refPicker.open) return []
+      const q = this.refPicker.query.trim().toLowerCase()
+      let items
+      if (this.refPicker.collection) {
+        items = this.refPicker.collection.items
+      } else {
+        items = []
+        for (const [id, list] of this.getRefIndex().targets) {
+          for (const t of list) items.push({ id, label: t.label, file: t.file, path: t.path, pathLabel: this.pathLabelOf(t.path) })
+        }
+      }
+      if (q) {
+        const tokens = q.split(/\s+/)
+        items = items.filter((it) => {
+          const hay = (it.label + ' ' + it.id + ' ' + it.pathLabel + ' ' + it.file).toLowerCase()
+          return tokens.every((tok) => hay.includes(tok))
+        })
+      }
+      return items.slice(0, 200)
     },
 
     canRenameKey() {
@@ -393,13 +486,16 @@ createApp({
       const c = this.config
       const d = this.cfgDraft
       const draftFields = (d.labelFields || '').split(',').map((f) => f.trim()).filter(Boolean)
+      const draftIdFields = (d.idFields || '').split(',').map((f) => f.trim()).filter(Boolean)
       return (
         d.dataDir !== c.dataDir ||
         d.publicDir !== c.publicDir ||
+        (d.uploadDir || '') !== (c.uploadDir || '') ||
         (d.logo || '') !== (c.logo || '') ||
         (d.logoLight || '') !== (c.logoLight || '') ||
         d.title !== c.title ||
-        JSON.stringify(draftFields) !== JSON.stringify(c.labelFields || [])
+        JSON.stringify(draftFields) !== JSON.stringify(c.labelFields || []) ||
+        JSON.stringify(draftIdFields) !== JSON.stringify(c.idFields || DEFAULT_ID_FIELDS)
       )
     },
 
@@ -414,21 +510,42 @@ createApp({
         const entries = []
         if (t === 'array') {
           node.forEach((v, i) => {
-            const vt = displayType(v)
+            let vt = displayType(v)
+            if (vt === 'string' && this.isRefString(v, i)) vt = 'reference'
             const fl = friendlyLabel(v, this.labelFields)
+            // Items read as their value: references as their target ("Jane Doe"), other
+            // primitives as themselves ("red", 42) - "[i]" only when there's nothing to show
+            const valLabel =
+              vt === 'reference'
+                ? this.refTargetLabel(v)
+                : vt !== 'object' && vt !== 'array' && vt !== 'null' && String(v).trim()
+                  ? truncate(String(v), 40)
+                  : null
             entries.push({
               key: i,
-              label: fl || `[${i}]`,
+              label: valLabel || fl || `[${i}]`,
               type: vt,
-              // Avoid repeating the friendly label in the preview slot
-              preview: fl && vt === 'object' ? Object.keys(v).length + ' keys' : this.entryPreview(v, vt)
+              // Primitives show their index in the subtle right-hand slot; objects keep
+              // the more useful "N keys" there
+              preview:
+                vt === 'object'
+                  ? Object.keys(v).length + (Object.keys(v).length === 1 ? ' key' : ' keys')
+                  : valLabel !== null
+                    ? `[${i}]`
+                    : this.entryPreview(v, vt)
             })
           })
         } else {
           for (const k of Object.keys(node)) {
             const v = node[k]
-            const vt = displayType(v)
-            entries.push({ key: k, label: k, type: vt, preview: this.entryPreview(v, vt) })
+            let vt = displayType(v)
+            if (vt === 'string' && this.isRefString(v, k)) vt = 'reference'
+            entries.push({
+              key: k,
+              label: k,
+              type: vt,
+              preview: vt === 'reference' ? '→ ' + this.refTargetLabel(v) : this.entryPreview(v, vt)
+            })
           }
         }
         cols.push({ title: truncate(title, 30), type: t, entries })
@@ -444,7 +561,17 @@ createApp({
       if (this.doc === undefined) return null
       const v = getNode(this.doc, this.selPath)
       if (v === undefined) return null
-      return { value: v, type: displayType(v) }
+      let type = displayType(v)
+      // A string converted to "file" via the dropdown keeps the upload editor for this
+      // session even before its value matches FILE_RE (e.g. an empty string pre-upload)
+      if (type === 'string' && this.fileTypeOverride === this.active + ':' + this.selPath.join('/')) type = 'file'
+      // Data-driven reference detection: a string equal to a known id (except under an
+      // idFields key, which is an identity, not a reference); dropdown override pre-pick
+      if (type === 'string' && this.selPath.length) {
+        const key = this.selPath[this.selPath.length - 1]
+        if (this.isRefString(v, key) || this.refTypeOverride === this.active + ':' + this.selPath.join('/')) type = 'reference'
+      }
+      return { value: v, type }
     },
 
     colorHex6() {
@@ -568,6 +695,34 @@ createApp({
     },
     selected() {
       this.$nextTick(() => this.resizeStrEditor())
+    },
+
+    // A column can appear without the selection moving (e.g. converting a value to
+    // object/array) - growth alone also scrolls the new column into view
+    columns(nv, ov) {
+      if (nv.length > (ov ? ov.length : 0)) {
+        this.$nextTick(() => {
+          const el = this.$refs.columnsEl
+          if (el) el.scrollLeft = el.scrollWidth
+        })
+      }
+    },
+
+    // Keep the current history entry's state at the live position so back/forward
+    // (which only jumps/file-switches push) always returns to where you really were
+    selPath: {
+      deep: true,
+      handler() {
+        if (!this._navRestoring && history.state) history.replaceState(this.navState(), '')
+        // Any navigation keeps the right-most (newest) column in view
+        this.$nextTick(() => {
+          const el = this.$refs.columnsEl
+          if (el) el.scrollLeft = el.scrollWidth
+        })
+      }
+    },
+    active() {
+      if (!this._navRestoring && history.state) history.replaceState(this.navState(), '')
     }
   },
 
@@ -586,21 +741,51 @@ createApp({
       this.closeSettings()
     })
     try {
+      api('/api/version')
+        .then((v) => {
+          this.version = v.version
+          if (v.updateAvailable) this.update = { latest: v.latest, command: v.updateCommand }
+        })
+        .catch(() => {}) // offline or registry hiccup - no update notice
       const { config, configPath } = await api('/api/config')
       this.config = config
       if (configPath) this.configPath = configPath
       this.setCfgDraft(config)
       if (config.labelFields && config.labelFields.length) this.labelFields = config.labelFields
-      document.title = config.title === '' ? config.jotsonBrand : config.jotsonBrand + ' - ' + config.title
+      document.title = config.title === '' ? JOTSON_BRAND : JOTSON_BRAND + ' - ' + config.title
       const { files } = await api('/api/files')
       this.files = files
-      await Promise.all(files.map((f) => this.loadFile(f.name)))
-      if (files.length) {
+      // Load files independently - one unreadable/malformed file must not blank the app
+      await Promise.all(
+        files.map((f) =>
+          this.loadFile(f.name).catch((e) => this.toast(`Failed to load ${f.name}: ${e.message}`, 'error', 8000))
+        )
+      )
+      const loaded = files.filter((f) => this.store[f.name])
+      if (loaded.length) {
         const saved = localStorage.getItem('cms.active')
-        this.active = files.some((f) => f.name === saved) ? saved : files[0].name
+        this.active = loaded.some((f) => f.name === saved) ? saved : loaded[0].name
         this.selPath = this.selPaths[this.active] || []
         this.sanitizeSelPath()
       }
+      // Browser back/forward across jumps and file switches. The current entry's state
+      // tracks the live position (replaceState in watchers); jumps push a new entry.
+      this._navRestoring = false
+      history.replaceState(this.navState(), '')
+      window.addEventListener('popstate', (e) => {
+        const st = e.state
+        if (!st || !st.file || !this.store[st.file]) return
+        this._navRestoring = true
+        this.view = 'columns'
+        if (st.file !== this.active) {
+          this.selPaths[this.active] = this.selPath
+          this.active = st.file
+        }
+        this.selPath = [...(st.selPath || [])]
+        this.$nextTick(() => {
+          this._navRestoring = false
+        })
+      })
     } catch (e) {
       this.toast('Failed to load: ' + e.message, 'error')
     }
@@ -619,10 +804,12 @@ createApp({
       this.dirtyMap[name] = false
       if (!this.undoStacks[name]) this.undoStacks[name] = { undo: [], redo: [] }
       this.searchIndex = null
+      this.refIndex = null
     },
 
     openFile(name) {
       if (name === this.active) return
+      history.pushState(this.navState(), '') // file switches are back-able
       this.selPaths[this.active] = this.selPath
       this.active = name
       this.selPath = this.selPaths[name] || []
@@ -643,6 +830,7 @@ createApp({
       const s = this.store[this.active]
       if (s) this.dirtyMap[this.active] = serialize(s.doc) !== s.prettyBase
       this.searchIndex = null
+      this.refIndex = null
     },
 
     /* ---------- columns / selection ---------- */
@@ -661,7 +849,13 @@ createApp({
       if (typeof seg !== 'number') return seg
       const node = getNode(this.doc, this.selPath.slice(0, i + 1))
       const fl = friendlyLabel(node, this.labelFields)
-      return fl ? `${seg} · ${truncate(fl, 24)}` : `[${seg}]`
+      if (fl) return `[${seg}] ${truncate(fl, 24)}`
+      // Primitive array items read as their value too (references as their target)
+      if (node !== null && node !== undefined && typeof node !== 'object') {
+        const s = typeof node === 'string' && this.isRefString(node, seg) ? this.refTargetLabel(node) : String(node)
+        if (s.trim()) return `[${seg}] ${truncate(s, 24)}`
+      }
+      return `[${seg}]`
     },
 
     typeGlyph(t) {
@@ -675,7 +869,9 @@ createApp({
           array: '[]',
           date: '📅',
           datetime: '🕓',
-          color: '🎨'
+          color: '🎨',
+          file: '📂',
+          reference: '🔗'
         }[t] || '?'
       )
     },
@@ -818,11 +1014,109 @@ createApp({
     /* ---------- editing ---------- */
     setValue(v) {
       if (!this.selPath.length) return
+      const tailKey = this.selPath[this.selPath.length - 1]
+      // Renaming an id that things point at: offer to retarget the references (debounced
+      // past the keystroke burst; the referrer list is captured before the first change)
+      if (typeof tailKey === 'string' && this.idFieldsList.includes(tailKey) && typeof v === 'string') {
+        this.trackIdRenameAt(this.selPath)
+      }
       this.snapshot('value:' + this.selPath.join('/'))
       const parent = getNode(this.doc, this.selPath.slice(0, -1))
-      parent[this.selPath[this.selPath.length - 1]] = v
+      parent[tailKey] = v
       this.refreshDirty()
       this.$nextTick(() => this.resizeStrEditor())
+    },
+
+    /* Overwrite an id field with a fresh uuid4 (undoable; the reference-update offer
+       follows automatically via trackIdRename) */
+    generateId() {
+      this.setValue(genId())
+      this.toast('Generated a fresh id')
+    },
+
+    trackIdRenameAt(path) {
+      const pathKey = this.active + ':' + path.join('/')
+      let p = this._idRename
+      if (!p || p.pathKey !== pathKey) {
+        const cur = getNode(this.doc, path) // pre-mutation: the original id
+        if (typeof cur !== 'string' || !cur) {
+          this._idRename = null
+          return
+        }
+        const refs = (this.getRefIndex().referrers.get(cur) || []).map((r) => ({ file: r.file, path: [...r.path] }))
+        if (!refs.length) {
+          this._idRename = null
+          return
+        }
+        p = this._idRename = { pathKey, file: this.active, path: [...path], oldId: cur, refs, timer: null }
+      }
+      clearTimeout(p.timer)
+      p.timer = setTimeout(() => this.offerIdRename(p), 1200)
+    },
+
+    offerIdRename(p) {
+      if (this._idRename === p) this._idRename = null
+      const s = this.store[p.file]
+      if (!s) return
+      const newId = getNode(s.doc, p.path)
+      if (typeof newId !== 'string' || !newId || newId === p.oldId) return
+      const n = p.refs.length
+      if (
+        !window.confirm(
+          `${n} reference${n === 1 ? '' : 's'} still point${n === 1 ? 's' : ''} at the old id "${p.oldId}".\n\nUpdate ${n === 1 ? 'it' : 'them'} to "${newId}" as well?`
+        )
+      )
+        return
+      const byFile = new Map()
+      for (const r of p.refs) {
+        if (!byFile.has(r.file)) byFile.set(r.file, [])
+        byFile.get(r.file).push(r)
+      }
+      let updated = 0
+      for (const [file, refs] of byFile) {
+        const fs = this.store[file]
+        if (!fs) continue
+        const stacks = this.undoStacks[file]
+        if (stacks) {
+          stacks.undo.push(JSON.stringify(fs.doc))
+          if (stacks.undo.length > 100) stacks.undo.shift()
+          stacks.redo = []
+        }
+        for (const r of refs) {
+          const parent = getNode(fs.doc, r.path.slice(0, -1))
+          const k = r.path[r.path.length - 1]
+          if (parent && parent[k] === p.oldId) {
+            parent[k] = newId
+            updated++
+          }
+        }
+        this.dirtyMap[file] = serialize(fs.doc) !== fs.prettyBase
+      }
+      this.searchIndex = null
+      this.refIndex = null
+      this.lastSnap = { key: '', time: 0 }
+      this.toast(`Updated ${updated} reference${updated === 1 ? '' : 's'} to "${newId}"`)
+    },
+
+    /* Type of a field row in the inspector's Fields section (same rules as columns) */
+    fieldType(v, key) {
+      let t = displayType(v)
+      if (t === 'string' && this.isRefString(v, key)) t = 'reference'
+      return t
+    },
+
+    isImgPath(v) {
+      return typeof v === 'string' && IMG_RE.test(v)
+    },
+
+    /* Inline edit of a key on the selected object (Fields section) */
+    setFieldValue(key, v) {
+      const obj = getNode(this.doc, this.selPath)
+      if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return
+      if (this.idFieldsList.includes(key) && typeof v === 'string') this.trackIdRenameAt([...this.selPath, key])
+      this.snapshot('field:' + this.selPath.join('/') + '/' + key)
+      obj[key] = v
+      this.refreshDirty()
     },
 
     changeType(e) {
@@ -843,8 +1137,19 @@ createApp({
       // date/datetime are stored as strings - switching between them and string is a value tweak
       let v
       if (t === 'string') {
-        if (curT === 'date' || curT === 'datetime' || curT === 'color') return // already a string; detection is automatic
+        if (curT === 'file') this.fileTypeOverride = null
+        if (curT === 'reference') this.refTypeOverride = null
+        if (curT === 'date' || curT === 'datetime' || curT === 'color' || curT === 'file' || curT === 'reference') return // already a string; detection is automatic
         v = curT === 'object' || curT === 'array' ? JSON.stringify(cur) : String(cur ?? '')
+      } else if (t === 'file') {
+        // Keep the string; the file editor takes over (upload sets a detectable path)
+        v = typeof cur === 'string' ? cur : String(cur ?? '')
+        this.fileTypeOverride = this.active + ':' + this.selPath.join('/')
+      } else if (t === 'reference') {
+        // Keep the string and open the picker - picking is the whole point of converting
+        v = typeof cur === 'string' ? cur : String(cur ?? '')
+        this.refTypeOverride = this.active + ':' + this.selPath.join('/')
+        this.$nextTick(() => this.openRefPicker())
       } else if (t === 'color') {
         v = COLOR_RE.test(String(cur)) ? String(cur) : '#000000'
       } else if (t === 'date') {
@@ -868,6 +1173,209 @@ createApp({
       const parent = getNode(this.doc, this.selPath.slice(0, -1))
       parent[this.selPath[this.selPath.length - 1]] = v
       this.refreshDirty()
+    },
+
+    /* ---------- references ---------- */
+    /* One walk over every loaded doc builds both directions: targets (id -> id-bearing
+       objects) and referrers (id -> string nodes equal to it). Strings under an idFields
+       key are identities, not references, and never count as referrers. */
+    buildRefIndex() {
+      const idFields = this.idFieldsList
+      const targets = new Map()
+      const strings = []
+      for (const f of this.files) {
+        const s = this.store[f.name]
+        if (!s) continue
+        const walk = (node, path) => {
+          const t = typeOf(node)
+          if (t === 'object') {
+            for (const field of idFields) {
+              const idv = node[field]
+              if (typeof idv === 'string' && idv) {
+                const arr = targets.get(idv) || []
+                arr.push({ file: f.name, path, label: friendlyLabel(node, this.labelFields) || idv, field })
+                targets.set(idv, arr)
+              }
+            }
+            for (const k of Object.keys(node)) walk(node[k], [...path, k])
+          } else if (t === 'array') {
+            node.forEach((v, i) => walk(v, [...path, i]))
+          } else if (typeof node === 'string' && node) {
+            const key = path.length ? path[path.length - 1] : ''
+            if (typeof key === 'string' && idFields.includes(key)) return
+            strings.push({ file: f.name, path, value: node })
+          }
+        }
+        walk(s.doc, [])
+      }
+      const referrers = new Map()
+      for (const s of strings) {
+        if (!targets.has(s.value)) continue
+        const arr = referrers.get(s.value) || []
+        arr.push({ file: s.file, path: s.path })
+        referrers.set(s.value, arr)
+      }
+      this.refIndex = { targets, referrers }
+    },
+
+    getRefIndex() {
+      if (!this.refIndex) this.buildRefIndex()
+      return this.refIndex
+    },
+
+    isRefString(v, key) {
+      if (typeof v !== 'string' || !v) return false
+      if (typeof key === 'string' && this.idFieldsList.includes(key)) return false
+      return this.getRefIndex().targets.has(v)
+    },
+
+    refTargetLabel(id) {
+      const t = this.getRefIndex().targets.get(id)
+      if (!t || !t.length) return id
+      return t[0].label + (t.length > 1 ? ` (×${t.length})` : '')
+    },
+
+    pathLabelOf(path) {
+      return path.map((s) => (typeof s === 'number' ? `[${s}]` : s)).join(' › ')
+    },
+
+    /* Friendly path segments for backlink rows: array indexes get their item's label
+       ("[0] Opening Keynote"), and a trailing index is dropped - it's the reference
+       cell itself, which is always the object being viewed. */
+    refPathSegs(file, path) {
+      const s = this.store[file]
+      let node = s ? s.doc : undefined
+      const segs = []
+      path.forEach((seg, i) => {
+        node = node === undefined || node === null ? undefined : node[seg]
+        if (typeof seg === 'number') {
+          if (i === path.length - 1) return
+          const fl = node !== undefined ? friendlyLabel(node, this.labelFields) : null
+          segs.push(fl ? `[${seg}] ${truncate(fl, 28)}` : `[${seg}]`)
+        } else {
+          segs.push(seg)
+        }
+      })
+      return segs
+    },
+
+    /* Deep paths collapse in the middle - the head names the collection, the tail is
+       the context that matters; the full path lives in the row's tooltip */
+    refPathLabel(file, path) {
+      const segs = this.refPathSegs(file, path)
+      if (segs.length > 4) segs.splice(1, segs.length - 4, '…')
+      return segs.join(' › ')
+    },
+
+    refPathFull(file, path) {
+      return this.shortName(file) + ' › ' + this.refPathSegs(file, path).join(' › ')
+    },
+
+    openRefPicker() {
+      this.getRefIndex()
+      this.refPicker = { open: true, query: '', collection: null, sel: 0 }
+      this.$nextTick(() => this.$refs.refPickerInput && this.$refs.refPickerInput.focus())
+    },
+
+    chooseRef(r) {
+      if (!r) return
+      this.setValue(r.id)
+      this.refPicker.open = false
+      this.toast(`Now references "${r.label}"`)
+    },
+
+    /* Teleporting navigation (search results, reference links). Pushes a history entry
+       so browser back returns to where you jumped from. */
+    jumpTo(file, path) {
+      if (!this.store[file]) return
+      history.pushState(this.navState(), '')
+      this.view = 'columns'
+      if (file !== this.active) {
+        this.selPaths[this.active] = this.selPath
+        this.active = file
+      }
+      this.selPath = [...path]
+      this.persistNav()
+    },
+
+    navState() {
+      return { file: this.active, selPath: [...this.selPath] }
+    },
+
+    /* Every in-memory string that mentions a uuid, across all open docs - unsaved edits
+       included, so a freshly uploaded (not yet saved) file never scans as an orphan */
+    collectUuidRefs() {
+      const refs = []
+      const uuidRe = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i
+      const walk = (n) => {
+        if (typeof n === 'string') {
+          if (uuidRe.test(n)) refs.push(n)
+        } else if (n && typeof n === 'object') {
+          Object.values(n).forEach(walk)
+        }
+      }
+      for (const name of Object.keys(this.store)) walk(this.store[name].doc)
+      return refs
+    },
+
+    async scanMedia() {
+      this.mediaScan = { loading: true, orphans: [] }
+      try {
+        const { orphans } = await api('/api/media/orphans', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ referenced: this.collectUuidRefs() })
+        })
+        this.mediaScan = { loading: false, orphans }
+        if (!orphans.length) this.toast('No unused uploads - the upload directory is clean')
+      } catch (e) {
+        this.mediaScan = null
+        this.toast('Scan failed: ' + e.message, 'error')
+      }
+    },
+
+    async cleanMedia() {
+      const orphans = this.mediaScan && this.mediaScan.orphans
+      if (!orphans || !orphans.length) return
+      const total = orphans.reduce((s, f) => s + f.size, 0)
+      const n = orphans.length
+      if (
+        !window.confirm(
+          `Delete ${n} unused upload${n === 1 ? '' : 's'} (${this.fmtSize(total)}) from the upload directory?\n\nThis removes the files from disk immediately.`
+        )
+      )
+        return
+      try {
+        const { deleted } = await api('/api/media/clean', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ files: orphans.map((f) => f.name) })
+        })
+        this.mediaScan = null
+        this.toast(`Deleted ${deleted.length} unused upload${deleted.length === 1 ? '' : 's'}`)
+      } catch (e) {
+        this.toast('Clean failed: ' + e.message, 'error')
+      }
+    },
+
+    fmtSize(n) {
+      return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? Math.round(n / 1024) + ' KB' : n + ' B'
+    },
+
+    async uploadFile(e) {
+      const f = e.target.files && e.target.files[0]
+      e.target.value = '' // allow re-picking the same file
+      if (!f || this.uploading) return
+      this.uploading = true
+      try {
+        const { path } = await api('/api/upload?name=' + encodeURIComponent(f.name), { method: 'POST', body: f })
+        this.setValue(path)
+        this.toast('Uploaded - stored as ' + path)
+      } catch (err) {
+        this.toast('Upload failed: ' + err.message, 'error')
+      } finally {
+        this.uploading = false
+      }
     },
 
     addItemAt(ci) {
@@ -1047,14 +1555,111 @@ createApp({
     deleteNode() {
       if (!this.selPath.length) return
       const label = this.segLabel(this.selPath[this.selPath.length - 1], this.selPath.length - 1)
-      if (!window.confirm(`Delete "${label}"?`)) return
+      const node = getNode(this.doc, this.selPath)
+      // Every id inside the deleted subtree - references to any of them will dangle
+      const ids = new Set()
+      const collect = (n) => {
+        if (n === null || typeof n !== 'object') return
+        if (!Array.isArray(n)) {
+          for (const f of this.idFieldsList) {
+            if (typeof n[f] === 'string' && n[f]) ids.add(n[f])
+          }
+        }
+        for (const c of Array.isArray(n) ? n : Object.values(n)) collect(c)
+      }
+      collect(node)
+      const refs = []
+      if (ids.size) {
+        const seen = new Set()
+        for (const id of ids) {
+          for (const r of this.getRefIndex().referrers.get(id) || []) {
+            // Referrers inside the subtree die with it - only outside ones dangle
+            const inSubtree =
+              r.file === this.active &&
+              r.path.length >= this.selPath.length &&
+              this.selPath.every((seg, i) => r.path[i] === seg)
+            const dedupe = r.file + '|' + r.path.join('.')
+            if (!inSubtree && !seen.has(dedupe)) {
+              seen.add(dedupe)
+              refs.push({ file: r.file, path: [...r.path] })
+            }
+          }
+        }
+      }
+      const warn = refs.length
+        ? `\n\n⚠ Referenced by ${refs.length} value${refs.length === 1 ? '' : 's'} elsewhere.`
+        : ''
+      if (!window.confirm(`Delete "${label}"?${warn}`)) return
+      const cleanup =
+        refs.length > 0 &&
+        window.confirm(
+          `Also delete the ${refs.length} reference${refs.length === 1 ? '' : 's'} to it?\n\nArray entries are removed; key values are blanked to "".`
+        )
       this.snapshot()
       const parent = getNode(this.doc, this.selPath.slice(0, -1))
       const key = this.selPath[this.selPath.length - 1]
-      if (Array.isArray(parent)) parent.splice(key, 1)
-      else delete parent[key]
+      let removed = 0
+      if (cleanup) removed = this.cleanupRefs(refs, ids)
+      // Delete by identity - reference cleanup may have shifted array positions
+      if (Array.isArray(parent)) {
+        const idx = typeof key === 'number' && parent[key] === node ? key : parent.indexOf(node)
+        if (idx !== -1) parent.splice(idx, 1)
+      } else {
+        delete parent[key]
+      }
       this.selPath = this.selPath.slice(0, -1)
       this.refreshDirty()
+      if (cleanup) this.toast(`Deleted "${truncate(String(label), 30)}" and ${removed} reference${removed === 1 ? '' : 's'}`)
+    },
+
+    /* Remove/blank the given reference strings (values must still be one of `ids`).
+       Array entries are spliced per-parent in descending index order so earlier removals
+       don't shift later ones; key values are blanked to keep object shapes intact. */
+    cleanupRefs(refs, ids) {
+      const byFile = new Map()
+      for (const r of refs) {
+        if (!byFile.has(r.file)) byFile.set(r.file, [])
+        byFile.get(r.file).push(r)
+      }
+      let removed = 0
+      for (const [file, list] of byFile) {
+        const s = this.store[file]
+        if (!s) continue
+        if (file !== this.active) {
+          const stacks = this.undoStacks[file]
+          if (stacks) {
+            stacks.undo.push(JSON.stringify(s.doc))
+            if (stacks.undo.length > 100) stacks.undo.shift()
+            stacks.redo = []
+          }
+        }
+        for (const r of list.filter((x) => typeof x.path[x.path.length - 1] !== 'number')) {
+          const parent = getNode(s.doc, r.path.slice(0, -1))
+          const k = r.path[r.path.length - 1]
+          if (parent && ids.has(parent[k])) {
+            parent[k] = ''
+            removed++
+          }
+        }
+        const byParent = new Map()
+        for (const r of list.filter((x) => typeof x.path[x.path.length - 1] === 'number')) {
+          const pk = r.path.slice(0, -1).join('.')
+          if (!byParent.has(pk)) byParent.set(pk, { path: r.path.slice(0, -1), idxs: [] })
+          byParent.get(pk).idxs.push(r.path[r.path.length - 1])
+        }
+        for (const g of byParent.values()) {
+          const arr = getNode(s.doc, g.path)
+          if (!Array.isArray(arr)) continue
+          for (const i of g.idxs.sort((a, b) => b - a)) {
+            if (ids.has(arr[i])) {
+              arr.splice(i, 1)
+              removed++
+            }
+          }
+        }
+        if (file !== this.active) this.dirtyMap[file] = serialize(s.doc) !== s.prettyBase
+      }
+      return removed
     },
 
     startRenameKey() {
@@ -1208,12 +1813,7 @@ createApp({
     gotoResult(r) {
       if (!r) return
       this.searchOpen = false
-      this.view = 'columns'
-      if (r.file !== this.active) {
-        this.selPaths[this.active] = this.selPath
-        this.active = r.file
-      }
-      this.selPath = [...r.path]
+      this.jumpTo(r.file, r.path)
     },
 
     /* ---------- save / diff ---------- */
@@ -1243,7 +1843,7 @@ createApp({
         s.prettyBase = this.pendingSaveText
         this.dirtyMap[this.active] = false
         this.diffOpen = false
-        this.toast(`Saved ${this.active}. Restart yarn dev to see changes on the site.`)
+        this.toast(`Saved ${this.active}`)
       } catch (e) {
         this.toast('Save failed: ' + e.message, 'error')
       } finally {
@@ -1281,10 +1881,12 @@ createApp({
       this.cfgDraft = {
         dataDir: config.dataDir,
         publicDir: config.publicDir,
+        uploadDir: config.uploadDir || '',
         logo: config.logo || '',
         logoLight: config.logoLight || '',
         title: config.title,
-        labelFields: (config.labelFields || DEFAULT_LABEL_FIELDS).join(', ')
+        labelFields: (config.labelFields || DEFAULT_LABEL_FIELDS).join(', '),
+        idFields: (config.idFields || DEFAULT_ID_FIELDS).join(', ')
       }
     },
 
@@ -1310,6 +1912,7 @@ createApp({
       if (dirsohanged && Object.values(this.dirtyMap).some(Boolean)) {
         if (!window.confirm('Changing directories reloads the app and discards unsaved edits. Continue?')) return
       }
+      const prevUploadDir = this.config.uploadDir || ''
       this.cfgSaving = true
       try {
         const { config, configPath } = await api('/api/config', {
@@ -1317,14 +1920,16 @@ createApp({
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             ...this.cfgDraft,
-            labelFields: this.cfgDraft.labelFields.split(',').map((f) => f.trim()).filter(Boolean)
+            labelFields: this.cfgDraft.labelFields.split(',').map((f) => f.trim()).filter(Boolean),
+            idFields: this.cfgDraft.idFields.split(',').map((f) => f.trim()).filter(Boolean)
           })
         })
         this.config = config
         if (configPath) this.configPath = configPath
         this.labelFields = config.labelFields && config.labelFields.length ? config.labelFields : DEFAULT_LABEL_FIELDS
+        this.refIndex = null // idFields may have changed
         this.setCfgDraft(config) // normalize the draft to what the server accepted
-        document.title = config.title === '' ? config.jotsonBrand : config.jotsonBrand + ' - ' + config.title
+        document.title = config.title === '' ? JOTSON_BRAND : JOTSON_BRAND + ' - ' + config.title
         if (dirsohanged) {
           this.dirtyMap = {} // suppress the beforeunload guard; user already confirmed
           location.reload()
@@ -1332,11 +1937,83 @@ createApp({
         }
         this.settingsOpen = false
         this.toast('Config saved to ' + this.configPath)
+        // Upload dir changed (public dir didn't - that path reloads above): offer to
+        // bring existing uploads along
+        if ((config.uploadDir || '') !== prevUploadDir) this.offerUploadMigration(prevUploadDir)
       } catch (e) {
         this.toast('Config save failed: ' + e.message, 'error')
       } finally {
         this.cfgSaving = false
       }
+    },
+
+    async offerUploadMigration(fromDir) {
+      const fromLabel = fromDir || '(public root)'
+      const toLabel = this.config.uploadDir || '(public root)'
+      if (
+        !window.confirm(
+          `Upload directory changed.\n\nMove existing uploads from "${fromLabel}" to "${toLabel}" and update all references?\n\nFiles move on disk immediately; the path updates land on your next save.`
+        )
+      )
+        return
+      try {
+        const { moved, from, to } = await api('/api/media/migrate', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ from: fromDir })
+        })
+        if (!moved.length) {
+          this.toast('No uploads found in the previous directory')
+          return
+        }
+        const mapping = new Map(moved.map((n) => [`${from}/${n}`, `${to}/${n}`]))
+        const updated = this.migrateUploadPaths(mapping)
+        this.toast(
+          `Moved ${moved.length} upload${moved.length === 1 ? '' : 's'}, updated ${updated} reference${updated === 1 ? '' : 's'}`,
+          'ok',
+          8000
+        )
+      } catch (e) {
+        this.toast('Migration failed: ' + e.message, 'error')
+      }
+    },
+
+    /* Rewrite every string value that exactly matches a moved upload's old path.
+       Per-file undo snapshots, like the other cross-file propagations. */
+    migrateUploadPaths(mapping) {
+      let updated = 0
+      for (const f of this.files) {
+        const s = this.store[f.name]
+        if (!s) continue
+        let touched = false
+        const walk = (node) => {
+          if (node === null || typeof node !== 'object') return
+          const keys = Array.isArray(node) ? node.map((_, i) => i) : Object.keys(node)
+          for (const k of keys) {
+            const v = node[k]
+            if (typeof v === 'string' && mapping.has(v)) {
+              if (!touched) {
+                const stacks = this.undoStacks[f.name]
+                if (stacks) {
+                  stacks.undo.push(JSON.stringify(s.doc))
+                  if (stacks.undo.length > 100) stacks.undo.shift()
+                  stacks.redo = []
+                }
+                touched = true
+              }
+              node[k] = mapping.get(v)
+              updated++
+            } else {
+              walk(v)
+            }
+          }
+        }
+        walk(s.doc)
+        if (touched) this.dirtyMap[f.name] = serialize(s.doc) !== s.prettyBase
+      }
+      this.searchIndex = null
+      this.refIndex = null
+      return updated
     },
 
     /* ---------- theme ---------- */
@@ -1374,6 +2051,18 @@ createApp({
     },
 
     /* ---------- misc ---------- */
+    copyUpdateCommand() {
+      if (!this.update) return
+      if (!this.update.command) {
+        this.toast('Drop-in install: pull or copy the latest jotson/ folder from GitHub')
+        return
+      }
+      navigator.clipboard
+        .writeText(this.update.command)
+        .then(() => this.toast(`Copied "${this.update.command}" - run it in a terminal, then restart JotSON`, 'ok', 8000))
+        .catch(() => this.toast('Could not access the clipboard', 'error'))
+    },
+
     async copyText(v) {
       try {
         await navigator.clipboard.writeText(v)
@@ -1389,12 +2078,12 @@ createApp({
       this.copyText(v !== null && typeof v === 'object' ? JSON.stringify(v, null, 2) : String(v))
     },
 
-    toast(msg, kind = 'ok') {
+    toast(msg, kind = 'ok', duration = 4000) {
       const id = Math.random().toString(36).slice(2)
       this.toasts.push({ id, msg, kind })
       setTimeout(() => {
         this.toasts = this.toasts.filter((t) => t.id !== id)
-      }, 4000)
+      }, duration)
     },
 
     onKeydown(e) {

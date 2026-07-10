@@ -36,14 +36,21 @@
     </nav>
 
     <div class="topbar-actions">
+      <button
+        v-if="update"
+        class="btn ghost update-pill"
+        :title="update.command ? 'Update available - click to copy: ' + update.command : 'Update available on GitHub'"
+        @click="copyUpdateCommand"
+      >⬆ v{{ update.latest }}</button>
       <div class="view-toggle">
         <button :class="{ on: view === 'columns' }" @click="setView('columns')">Columns</button>
         <button :class="{ on: view === 'raw' }" @click="setView('raw')">Raw</button>
       </div>
       <button class="btn ghost" @click="openSearch" title="Search all files (Ctrl+K)">🔍 <kbd>Ctrl K</kbd></button>
-      <button class="btn ghost" @click="toggleTheme" :title="theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'">{{ theme === 'dark' ? '☀' : '🌙' }}</button>
-      <button class="btn ghost" @click="toggleSettings" title="Settings">⚙</button>
+      <button class="btn ghost" @click="toggleTheme" :title="theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'">{{ theme === 'dark' ? '🔆' : '🌙' }}</button>
+      <button class="btn ghost" @click="toggleSettings" title="Settings">⚙️</button>
       <button class="btn ghost" :disabled="!canUndo" @click="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
+      <button class="btn ghost" :disabled="!canRedo" @click="redo" title="Redo (Ctrl+Shift+Z)">↷ Redo</button>
       <button class="btn save" :disabled="!isDirty(active)" @click="requestSave" title="Save (Ctrl+S)">
         Save{{ isDirty(active) ? ' •' : '' }}
       </button>
@@ -52,10 +59,27 @@
 
   <!-- ===== Settings popover ===== -->
   <div v-if="settingsOpen" class="settings-pop">
-    <label>Data directory <span class="hint">(JSON files, relative to project root)</span></label>
+    <label>Data directory <span class="hint">(JSON files, relative to project root; empty = project root)</span></label>
     <input v-model="cfgDraft.dataDir" spellcheck="false" placeholder="data/json" />
-    <label>Public directory <span class="hint">(media root for previews)</span></label>
+    <label>Public directory <span class="hint">(media root for previews; empty = project root)</span></label>
     <input v-model="cfgDraft.publicDir" spellcheck="false" placeholder="public" />
+    <label>Upload directory <span class="hint">(inside the public directory; empty = its root)</span></label>
+    <input v-model="cfgDraft.uploadDir" spellcheck="false" placeholder="uploads" />
+    <div class="op-group">
+      <button class="btn op" :disabled="mediaScan && mediaScan.loading" @click="scanMedia" title="Find uploaded files no data file references">
+        {{ mediaScan && mediaScan.loading ? 'Scanning…' : '🧹 Scan unused uploads' }}
+      </button>
+    </div>
+    <div v-if="mediaScan && !mediaScan.loading && mediaScan.orphans.length" class="orphan-list">
+      <div v-for="f in mediaScan.orphans" :key="f.name" class="orphan-row">
+        <span class="orphan-name">{{ f.name }}</span>
+        <span class="orphan-size">{{ fmtSize(f.size) }}</span>
+      </div>
+      <div class="op-group">
+        <button class="btn op danger" @click="cleanMedia">Delete {{ mediaScan.orphans.length }} unused file{{ mediaScan.orphans.length === 1 ? '' : 's' }}</button>
+        <button class="btn ghost" @click="mediaScan = null">Dismiss</button>
+      </div>
+    </div>
     <label>Logo, dark theme <span class="hint">(optional - site-relative image path; empty shows the title text)</span></label>
     <input v-model="cfgDraft.logo" spellcheck="false" placeholder="/assets/images/logo.svg" />
     <label>Logo, light theme <span class="hint">(optional - variant for light mode; empty reuses the logo on a dark chip)</span></label>
@@ -64,14 +88,15 @@
     <input v-model="cfgDraft.title" spellcheck="false" placeholder="My Project" />
     <label>Label fields <span class="hint">(priority order for naming objects in columns &amp; breadcrumbs)</span></label>
     <input v-model="cfgDraft.labelFields" spellcheck="false" placeholder="title, label, name, urlSlug, theme, year, id" />
+    <label>Id fields <span class="hint">(field names that identify objects for references)</span></label>
+    <input v-model="cfgDraft.idFields" spellcheck="false" placeholder="id" />
     <div class="op-group">
       <button class="btn" :class="cfgDirty ? 'save' : 'op'" :disabled="cfgSaving || !cfgDirty" @click="saveConfig">
         {{ cfgSaving ? 'Saving…' : cfgDirty ? 'Save config •' : 'Save config' }}
       </button>
     </div>
     <p class="hint">Config is stored in <code>{{ configPath }}</code>. Changing directories reloads the app.</p>
-    <p class="hint">Undo: Ctrl+Z &nbsp;·&nbsp; Redo: Ctrl+Shift+Z &nbsp;·&nbsp; Save: Ctrl+S &nbsp;·&nbsp; Search: Ctrl+K &nbsp;·&nbsp; Navigate: 🔼🔽◀️▶️ &nbsp;·&nbsp; Prev/next sibling: Ctrl+🔼/🔽</p>
-    <p class="hint settings-credit">{{config.jotsonBrand}} by Michael Niles</p>
+    <p class="hint settings-credit">{{ jotsonBrand }}{{ version ? ' v' + version : '' }} by Michael Niles</p>
   </div>
 
   <!-- ===== Path bar ===== -->
@@ -82,6 +107,7 @@
       <button class="crumb" @click="selPath = selPath.slice(0, i + 1)">{{ segLabel(seg, i) }}</button>
     </template>
     <button v-if="selPath.length" class="btn tiny ghost copy-path" @click="copyPath" title="Copy JSON path">copy path</button>
+    <span class="kbd-hints">Save <kbd>Ctrl+S</kbd> · Navigate <kbd>↑↓←→</kbd> · Sibling <kbd>Ctrl+↑/↓</kbd></span>
   </div>
 
   <!-- ===== Main ===== -->
@@ -114,7 +140,7 @@
               class="addkey-inline"
               placeholder="key name - Enter to add"
               spellcheck="false"
-              @keydown.enter="commitAddKey(ci)"
+              @keydown.enter.prevent="commitAddKey(ci)"
               @keydown.esc="cancelAddKey"
               @blur="cancelAddKey"
             />
@@ -159,12 +185,35 @@
         <div class="insp-row type-switch" v-if="selPath.length">
           <label>Type</label>
           <select :value="selected.type" @change="changeType($event)">
-            <option v-for="t in ['string','color','date','datetime','number','boolean','null','object','array']" :key="t" :value="t">{{ t }}</option>
+            <option v-for="t in ['string','color','date','datetime','file','reference','number','boolean','null','object','array']" :key="t" :value="t">{{ t }}</option>
           </select>
+          <span v-if="selected.type === 'object' || selected.type === 'array'" class="type-count">
+            {{ selected.type === 'array'
+              ? selected.value.length + (selected.value.length === 1 ? ' item' : ' items')
+              : Object.keys(selected.value).length + (Object.keys(selected.value).length === 1 ? ' key' : ' keys') }}
+          </span>
         </div>
 
-        <!-- Value editors -->
-        <div class="insp-editor">
+        <!-- Structural operations -->
+        <div class="insp-ops" v-if="selPath.length">
+          <template v-if="parentIsArray">
+            <div class="op-group">
+              <button class="btn op" @click="moveItem(-1)" :disabled="tipIndex === 0" title="Move up">↑</button>
+              <button class="btn op" @click="moveItem(1)" :disabled="tipIndex === parentLength - 1" title="Move down">↓</button>
+              <button class="btn op" @click="duplicateItem">⧉ Duplicate</button>
+              <button class="btn op danger" @click="deleteNode">✕ Delete item</button>
+            </div>
+          </template>
+
+          <template v-else>
+            <div class="op-group">
+              <button class="btn op danger" @click="deleteNode">✕ Delete key</button>
+            </div>
+          </template>
+        </div>
+
+        <!-- Value editors (containers have none - root keeps the count note) -->
+        <div class="insp-editor" v-if="!['object', 'array'].includes(selected.type) || !selPath.length">
           <template v-if="selected.type === 'string'">
             <textarea
               class="str-editor"
@@ -174,7 +223,10 @@
               ref="strEditor"
               spellcheck="false"
             ></textarea>
-            <div class="hint">Use \n for line breaks in CTAs - actual newlines are saved as \n in JSON.</div>
+            <div v-if="isIdKey" class="op-group">
+              <button class="btn op" @click="generateId" title="Overwrite this id with a fresh uuid4">⚄ Generate UUID</button>
+            </div>
+            <div v-else class="hint">Use \n for line breaks in CTAs - actual newlines are saved as \n in JSON.</div>
           </template>
 
           <template v-else-if="selected.type === 'color'">
@@ -195,6 +247,34 @@
             <div class="hint">Stored as ISO "YYYY-MM-DDTHH:mm"{{ dtSuffix ? ' (existing "' + dtSuffix + '" suffix is preserved)' : '' }}.</div>
           </template>
 
+          <template v-else-if="selected.type === 'file'">
+            <div class="file-editor">
+              <input class="file-path" :value="selected.value" @change="setValue($event.target.value)" spellcheck="false" placeholder="/media/image.png" />
+              <button class="btn op" :disabled="uploading" @click="$refs.fileInput.click()">{{ uploading ? 'Uploading…' : '⇪ Upload file' }}</button>
+              <input ref="fileInput" type="file" hidden @change="uploadFile" />
+            </div>
+            <div class="hint">Uploads are copied into the upload directory as <code>&lt;uuid&gt;.&lt;ext&gt;</code> and the path is stored here. The path is editable (applies on Enter/blur).</div>
+          </template>
+
+          <template v-else-if="selected.type === 'reference'">
+            <div class="ref-editor">
+              <input class="ref-id" :value="selected.value" @change="refTypeOverride = active + ':' + selPath.join('/'); setValue($event.target.value)" spellcheck="false" placeholder="id of the referenced object" />
+              <button class="btn op" @click="openRefPicker">🔗 Pick…</button>
+            </div>
+            <div v-if="refInfo" class="ref-card">
+              <div v-if="refInfo.broken" class="ref-broken">⚠ No object with this id - pick a target or fix the id.</div>
+              <template v-else>
+                <div v-if="refInfo.ambiguous" class="ref-broken">⚠ {{ refInfo.targets.length }} objects share this id:</div>
+                <button v-for="(t, i) in refInfo.targets" :key="i" class="ref-target" @click="jumpTo(t.file, t.path)" title="Go to the referenced object">
+                  <span class="ref-label">{{ t.label }}</span>
+                  <span class="ref-loc">{{ shortName(t.file) }} › {{ pathLabelOf(t.path) }}</span>
+                  <span class="ref-go">→</span>
+                </button>
+              </template>
+            </div>
+            <div class="hint">Stored as the plain id string of the referenced object.</div>
+          </template>
+
           <template v-else-if="selected.type === 'number'">
             <input class="num-editor" type="number" step="any" :value="selected.value"
                    @input="setValue($event.target.value === '' ? 0 : Number($event.target.value))" />
@@ -212,7 +292,8 @@
           </template>
 
           <template v-else>
-            <div class="container-note">
+            <!-- Root selection has no type row, so the count lives here -->
+            <div v-if="!selPath.length" class="container-note">
               {{ selected.type === 'array'
                 ? selected.value.length + (selected.value.length === 1 ? ' item' : ' items')
                 : Object.keys(selected.value).length + (Object.keys(selected.value).length === 1 ? ' key' : ' keys') }}
@@ -225,7 +306,7 @@
           <div class="sp-title">Preview</div>
           <img v-if="preview.kind === 'image'" :src="preview.url" alt="" @error="preview.failed = true" />
           <video v-if="preview.kind === 'video'" :src="preview.url" controls muted playsinline></video>
-          <div v-if="preview.kind === 'color'" class="sp-color"><span class="swatch" :style="{ background: preview.value }"></span>{{ preview.value }}</div>
+          <div v-if="preview.kind === 'color'" class="sp-color"><span class="swatch" :style="{ background: preview.value }"></span></div>
           <div v-if="preview.kind === 'date'" class="sp-date">📅 {{ preview.human }}</div>
           <div v-if="preview.kind === 'date' && preview.formats.length" class="sp-formats">
             <button v-for="f in preview.formats" :key="f.label" class="sp-format" :title="'Click to copy'" @click="copyText(f.value)">
@@ -266,20 +347,46 @@
           <div v-if="preview.kind === 'multiline'" class="sp-multiline">{{ preview.value }}</div>
         </div>
 
-        <!-- Structural operations -->
-        <div class="insp-ops" v-if="selPath.length">
-          <template v-if="parentIsArray">
-            <div class="op-group">
-              <button class="btn op" @click="moveItem(-1)" :disabled="tipIndex === 0" title="Move up">↑</button>
-              <button class="btn op" @click="moveItem(1)" :disabled="tipIndex === parentLength - 1" title="Move down">↓</button>
-              <button class="btn op" @click="duplicateItem">⧉ Duplicate</button>
-              <button class="btn op danger" @click="deleteNode">✕ Delete item</button>
-            </div>
-          </template>
+        <!-- Reverse references: everything that points at this id-bearing object -->
+        <div v-if="reverseRefs" class="ref-backlinks">
+          <div class="sp-title">Referenced by <span class="count">{{ reverseRefs.refs.length }}</span></div>
+          <button v-for="(r, i) in reverseRefs.refs" :key="i" class="ref-target" @click="jumpTo(r.file, r.path)" :title="'Go to: ' + refPathFull(r.file, r.path)">
+            <span class="ref-loc">{{ shortName(r.file) }} › {{ refPathLabel(r.file, r.path) }}</span>
+            <span class="ref-go">→</span>
+          </button>
+          <div v-if="!reverseRefs.refs.length" class="hint">Nothing references this object yet.</div>
+        </div>
 
-          <template v-else>
-            <div class="op-group">
-              <button class="btn op danger" @click="deleteNode">✕ Delete key</button>
+        <!-- Object fields: every key editable inline with previews, hr-delimited -->
+        <div v-if="selected.type === 'object' && Object.keys(selected.value).length" class="obj-fields">
+          <hr class="of-rule" />
+          <div class="sp-title">Fields</div>
+          <template v-for="(fv, fk, fi) in selected.value" :key="fk">
+            <hr v-if="fi > 0" class="of-rule" />
+            <div class="obj-field">
+              <button class="of-key" @click="selPath = [...selPath, fk]" :title="'Open ' + fk">
+                <span class="cell-type" :class="'t-' + fieldType(fv, fk)">{{ typeGlyph(fieldType(fv, fk)) }}</span>
+                <span class="of-name">{{ fk }}</span>
+              </button>
+              <div class="of-value">
+                <span v-if="typeof fv === 'string' && idFieldsList.includes(fk)" class="of-readonly" :title="'View-only here - open ' + fk + ' to edit it'">{{ fv }}</span>
+                <template v-else-if="['string','date','datetime','color','file'].includes(fieldType(fv, fk))">
+                  <span v-if="fieldType(fv, fk) === 'color'" class="swatch of-swatch" :style="{ background: fv }"></span>
+                  <textarea v-if="String(fv).includes('\n')" class="of-input" rows="2" :value="fv" @change="setFieldValue(fk, $event.target.value)" spellcheck="false"></textarea>
+                  <input v-else class="of-input" :value="fv" @change="setFieldValue(fk, $event.target.value)" spellcheck="false" />
+                </template>
+                <input v-else-if="fieldType(fv, fk) === 'number'" class="of-input" type="number" step="any" :value="fv" @change="setFieldValue(fk, $event.target.value === '' ? 0 : Number($event.target.value))" />
+                <div v-else-if="fieldType(fv, fk) === 'boolean'" class="bool-toggle of-bool">
+                  <button :class="{ on: fv === true }" @click="setFieldValue(fk, true)">true</button>
+                  <button :class="{ on: fv === false }" @click="setFieldValue(fk, false)">false</button>
+                </div>
+                <span v-else-if="fieldType(fv, fk) === 'null'" class="null-note">null</span>
+                <button v-else-if="fieldType(fv, fk) === 'reference'" class="of-container" @click="selPath = [...selPath, fk]">→ {{ refTargetLabel(fv) }}</button>
+                <button v-else class="of-container" @click="selPath = [...selPath, fk]">{{ entryPreview(fv, fieldType(fv, fk)) }} ›</button>
+              </div>
+              <div v-if="fieldType(fv, fk) === 'file' && isImgPath(fv)" class="smart-preview">
+                <img :src="resolveUrl(fv)" alt="" />
+              </div>
             </div>
           </template>
         </div>
@@ -338,6 +445,47 @@
           <span class="sr-value">{{ r.valuePreview }}</span>
         </button>
         <div v-if="searchQuery && !searchResults.length" class="search-empty">No matches</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Reference picker modal ===== -->
+  <div v-if="refPicker.open" class="modal-scrim" @click.self="refPicker.open = false">
+    <div class="modal search-modal">
+      <input
+        ref="refPickerInput"
+        v-model="refPicker.query"
+        class="search-input"
+        :placeholder="refPicker.collection ? 'Search in ' + refPicker.collection.label + '…' : 'Search objects to reference, or pick a collection below…'"
+        @keydown.down.prevent="refPicker.sel = Math.min(refPicker.sel + 1, refPickerResults.length - 1)"
+        @keydown.up.prevent="refPicker.sel = Math.max(refPicker.sel - 1, 0)"
+        @keydown.enter.prevent="chooseRef(refPickerResults[refPicker.sel])"
+        @keydown.esc="refPicker.open = false"
+        spellcheck="false"
+      />
+      <button v-if="refPicker.collection" class="btn tiny ghost ref-back" @click="refPicker.collection = null; refPicker.sel = 0">‹ All collections</button>
+      <div v-if="!refPicker.query && !refPicker.collection && refCollections.length" class="ref-collections">
+        <button v-for="c in refCollections" :key="c.key" class="ref-collection" @click="refPicker.collection = c; refPicker.sel = 0">
+          <span class="rc-label">{{ c.label }}</span>
+          <span class="count">{{ c.items.length }}</span>
+          <span class="sr-file">{{ shortName(c.file) }}</span>
+        </button>
+        <div v-if="!refCollections.length" class="search-empty">No arrays of id-bearing objects found</div>
+      </div>
+      <div v-else class="search-results">
+        <button
+          v-for="(r, i) in refPickerResults"
+          :key="r.id + '@' + i"
+          class="search-result"
+          :class="{ sel: i === refPicker.sel }"
+          @mouseenter="refPicker.sel = i"
+          @click="chooseRef(r)"
+        >
+          <span class="sr-file">{{ shortName(r.file) }}</span>
+          <span class="sr-path">{{ r.pathLabel }}</span>
+          <span class="sr-value">{{ r.label }}</span>
+        </button>
+        <div v-if="!refPickerResults.length" class="search-empty">No objects with an id match</div>
       </div>
     </div>
   </div>
