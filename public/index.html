@@ -1,0 +1,402 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{{ config.title }}</title>
+  <link rel="stylesheet" href="/styles.css" />
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🗂️</text></svg>" />
+</head>
+<body>
+<div id="app" v-cloak>
+  <!-- ===== Header ===== -->
+  <header class="topbar">
+    <div class="brand">
+      <img
+        v-if="brandLogo"
+        class="brand-logo"
+        :class="{ chip: theme === 'light' && !config.logoLight }"
+        :src="resolveUrl(brandLogo)"
+        :alt="config.title"
+      />
+      <span v-else-if="config.title" class="brand-title">{{ config.title }}</span>
+      <span v-else><span class="brand-bracket">{</span>J<span class="brand-ot">𝘰𝓉</span>SON<span class="brand-bracket">}</span></span>
+    </div>
+
+    <nav class="file-tabs">
+      <button
+        v-for="f in files"
+        :key="f.name"
+        class="file-tab"
+        :class="{ active: f.name === active, dirty: isDirty(f.name) }"
+        @click="openFile(f.name)"
+      >
+        {{ shortName(f.name) }}<span v-if="isDirty(f.name)" class="dirty-dot" title="Unsaved changes">●</span>
+      </button>
+    </nav>
+
+    <div class="topbar-actions">
+      <div class="view-toggle">
+        <button :class="{ on: view === 'columns' }" @click="setView('columns')">Columns</button>
+        <button :class="{ on: view === 'raw' }" @click="setView('raw')">Raw</button>
+      </div>
+      <button class="btn ghost" @click="openSearch" title="Search all files (Ctrl+K)">🔍 <kbd>Ctrl K</kbd></button>
+      <button class="btn ghost" @click="toggleTheme" :title="theme === 'dark' ? 'Switch to light theme' : 'Switch to dark theme'">{{ theme === 'dark' ? '☀' : '🌙' }}</button>
+      <button class="btn ghost" @click="toggleSettings" title="Settings">⚙</button>
+      <button class="btn ghost" :disabled="!canUndo" @click="undo" title="Undo (Ctrl+Z)">↶ Undo</button>
+      <button class="btn save" :disabled="!isDirty(active)" @click="requestSave" title="Save (Ctrl+S)">
+        Save{{ isDirty(active) ? ' •' : '' }}
+      </button>
+    </div>
+  </header>
+
+  <!-- ===== Settings popover ===== -->
+  <div v-if="settingsOpen" class="settings-pop">
+    <label>Data directory <span class="hint">(JSON files, relative to project root)</span></label>
+    <input v-model="cfgDraft.dataDir" spellcheck="false" placeholder="data/json" />
+    <label>Public directory <span class="hint">(media root for previews)</span></label>
+    <input v-model="cfgDraft.publicDir" spellcheck="false" placeholder="public" />
+    <label>Logo, dark theme <span class="hint">(optional - site-relative image path; empty shows the title text)</span></label>
+    <input v-model="cfgDraft.logo" spellcheck="false" placeholder="/assets/images/logo.svg" />
+    <label>Logo, light theme <span class="hint">(optional - variant for light mode; empty reuses the logo on a dark chip)</span></label>
+    <input v-model="cfgDraft.logoLight" spellcheck="false" placeholder="/assets/images/logo-dark-text.svg" />
+    <label>Title <span class="hint">(text brand fallback, console name)</span></label>
+    <input v-model="cfgDraft.title" spellcheck="false" placeholder="My Project" />
+    <label>Label fields <span class="hint">(priority order for naming objects in columns &amp; breadcrumbs)</span></label>
+    <input v-model="cfgDraft.labelFields" spellcheck="false" placeholder="title, label, name, urlSlug, theme, year, id" />
+    <div class="op-group">
+      <button class="btn" :class="cfgDirty ? 'save' : 'op'" :disabled="cfgSaving || !cfgDirty" @click="saveConfig">
+        {{ cfgSaving ? 'Saving…' : cfgDirty ? 'Save config •' : 'Save config' }}
+      </button>
+    </div>
+    <p class="hint">Config is stored in <code>{{ configPath }}</code>. Changing directories reloads the app.</p>
+    <p class="hint">Undo: Ctrl+Z &nbsp;·&nbsp; Redo: Ctrl+Shift+Z &nbsp;·&nbsp; Save: Ctrl+S &nbsp;·&nbsp; Search: Ctrl+K &nbsp;·&nbsp; Navigate: 🔼🔽◀️▶️ &nbsp;·&nbsp; Prev/next sibling: Ctrl+🔼/🔽</p>
+    <p class="hint settings-credit">{{config.jotsonBrand}} by Michael Niles</p>
+  </div>
+
+  <!-- ===== Path bar ===== -->
+  <div v-if="view === 'columns' && doc !== undefined" class="pathbar">
+    <button class="crumb root" @click="selPath = []">{{ active }}</button>
+    <template v-for="(seg, i) in selPath" :key="i">
+      <span class="crumb-sep">›</span>
+      <button class="crumb" @click="selPath = selPath.slice(0, i + 1)">{{ segLabel(seg, i) }}</button>
+    </template>
+    <button v-if="selPath.length" class="btn tiny ghost copy-path" @click="copyPath" title="Copy JSON path">copy path</button>
+  </div>
+
+  <!-- ===== Main ===== -->
+  <main class="main" v-if="doc !== undefined">
+
+    <!-- Columns view -->
+    <div v-if="view === 'columns'" class="columns-wrap">
+      <div class="columns" ref="columnsEl">
+        <div v-for="(col, ci) in columns" :key="ci" class="column">
+          <div class="column-title">{{ col.title }} <span class="count">{{ col.entries.length }}</span></div>
+          <div class="column-scroll">
+            <button
+              v-for="entry in col.entries"
+              :key="entry.key"
+              class="cell"
+              :class="{ selected: isOnPath(ci, entry.key), tip: isTip(ci, entry.key) }"
+              @click="selectCell(ci, entry.key)"
+              @contextmenu.prevent="openCtxMenu($event, ci, entry.key)"
+            >
+              <span class="cell-type" :class="'t-' + entry.type">{{ typeGlyph(entry.type) }}</span>
+              <span class="cell-key">{{ entry.label }}</span>
+              <span class="cell-preview">{{ entry.preview }}</span>
+              <span v-if="entry.type === 'object' || entry.type === 'array'" class="cell-arrow">›</span>
+            </button>
+            <div v-if="!col.entries.length" class="empty-col">empty {{ col.type }}</div>
+            <input
+              v-if="addingKeyAt === ci"
+              ref="inlineKeyInput"
+              v-model="addKeyDraft"
+              class="addkey-inline"
+              placeholder="key name - Enter to add"
+              spellcheck="false"
+              @keydown.enter="commitAddKey(ci)"
+              @keydown.esc="cancelAddKey"
+              @blur="cancelAddKey"
+            />
+            <button v-else class="cell add-cell" @click="col.type === 'array' ? addItemAt(ci) : addKeyAt(ci)">
+              ＋ {{ col.type === 'array' ? 'Add item' : 'Add key' }}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Inspector -->
+      <div
+        v-if="selected"
+        class="resize-handle"
+        title="Drag to resize - double-click to reset"
+        @pointerdown="startResize"
+        @dblclick="resetResize"
+      ></div>
+      <aside class="inspector" v-if="selected" :style="{ width: inspWidth + 'px', minWidth: inspWidth + 'px' }">
+        <div class="insp-head">
+          <span class="type-badge" :class="'t-' + selected.type">{{ selected.type }}</span>
+          <template v-if="editingKey">
+            <input
+              ref="keyNameInput"
+              v-model="renameKeyName"
+              class="keyname-input"
+              spellcheck="false"
+              @keydown.enter="commitRename"
+              @keydown.esc="cancelRename"
+            />
+            <button class="btn tiny op" title="Save (Enter)" @click="commitRename">✓</button>
+            <button class="btn tiny ghost" title="Cancel (Esc)" @click="cancelRename">✕</button>
+          </template>
+          <template v-else>
+            <span class="insp-key">{{ selPath.length ? segLabel(selPath[selPath.length - 1], selPath.length - 1) : active }}</span>
+            <button v-if="canRenameKey" class="btn tiny ghost edit-key" title="Rename key" @click="startRenameKey">✎</button>
+            <button class="btn tiny ghost copy-value" title="Copy value" @click="copyValue">⧉ copy</button>
+          </template>
+        </div>
+
+        <!-- Type switcher -->
+        <div class="insp-row type-switch" v-if="selPath.length">
+          <label>Type</label>
+          <select :value="selected.type" @change="changeType($event)">
+            <option v-for="t in ['string','color','date','datetime','number','boolean','null','object','array']" :key="t" :value="t">{{ t }}</option>
+          </select>
+        </div>
+
+        <!-- Value editors -->
+        <div class="insp-editor">
+          <template v-if="selected.type === 'string'">
+            <textarea
+              class="str-editor"
+              :value="selected.value"
+              @input="setValue($event.target.value)"
+              rows="1"
+              ref="strEditor"
+              spellcheck="false"
+            ></textarea>
+            <div class="hint">Use \n for line breaks in CTAs - actual newlines are saved as \n in JSON.</div>
+          </template>
+
+          <template v-else-if="selected.type === 'color'">
+            <div class="color-editor">
+              <input type="color" :value="colorHex6" @input="setValue($event.target.value)" title="Pick a color" />
+              <input class="color-text" :value="selected.value" @change="setValue($event.target.value)" spellcheck="false" />
+            </div>
+            <div class="hint">Stored as a hex string. Pick with the swatch, or type a #rgb / #rrggbb value (applies on Enter/blur).</div>
+          </template>
+
+          <template v-else-if="selected.type === 'date'">
+            <input class="date-editor" type="date" :value="selected.value" @input="$event.target.value && setValue($event.target.value)" />
+            <div class="hint">Stored as "YYYY-MM-DD" - the format the site's data already uses.</div>
+          </template>
+
+          <template v-else-if="selected.type === 'datetime'">
+            <input class="date-editor" type="datetime-local" :value="dtLocalValue" @input="$event.target.value && setValue($event.target.value + dtSuffix)" />
+            <div class="hint">Stored as ISO "YYYY-MM-DDTHH:mm"{{ dtSuffix ? ' (existing "' + dtSuffix + '" suffix is preserved)' : '' }}.</div>
+          </template>
+
+          <template v-else-if="selected.type === 'number'">
+            <input class="num-editor" type="number" step="any" :value="selected.value"
+                   @input="setValue($event.target.value === '' ? 0 : Number($event.target.value))" />
+          </template>
+
+          <template v-else-if="selected.type === 'boolean'">
+            <div class="bool-toggle">
+              <button :class="{ on: selected.value === true }" @click="setValue(true)">true</button>
+              <button :class="{ on: selected.value === false }" @click="setValue(false)">false</button>
+            </div>
+          </template>
+
+          <template v-else-if="selected.type === 'null'">
+            <div class="null-note">null</div>
+          </template>
+
+          <template v-else>
+            <div class="container-note">
+              {{ selected.type === 'array'
+                ? selected.value.length + (selected.value.length === 1 ? ' item' : ' items')
+                : Object.keys(selected.value).length + (Object.keys(selected.value).length === 1 ? ' key' : ' keys') }}
+            </div>
+          </template>
+        </div>
+
+        <!-- Smart preview -->
+        <div v-if="preview" class="smart-preview">
+          <div class="sp-title">Preview</div>
+          <img v-if="preview.kind === 'image'" :src="preview.url" alt="" @error="preview.failed = true" />
+          <video v-if="preview.kind === 'video'" :src="preview.url" controls muted playsinline></video>
+          <div v-if="preview.kind === 'color'" class="sp-color"><span class="swatch" :style="{ background: preview.value }"></span>{{ preview.value }}</div>
+          <div v-if="preview.kind === 'date'" class="sp-date">📅 {{ preview.human }}</div>
+          <div v-if="preview.kind === 'date' && preview.formats.length" class="sp-formats">
+            <button v-for="f in preview.formats" :key="f.label" class="sp-format" :title="'Click to copy'" @click="copyText(f.value)">
+              <span class="spf-label">{{ f.label }}</span>
+              <span class="spf-value">{{ f.value }}</span>
+            </button>
+            <div v-if="preview.dk === 'date'" class="hint">Timestamps assume local midnight for date-only values.</div>
+          </div>
+          <iframe
+            v-if="preview.kind === 'embed'"
+            class="sp-embed"
+            :src="preview.embedUrl"
+            allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+            allowfullscreen
+            referrerpolicy="strict-origin-when-cross-origin"
+          ></iframe>
+          <div v-if="preview.kind === 'url' || preview.kind === 'embed'" class="sp-url">
+              <span class="badge" :class="preview.internal ? 'internal' : 'external'">{{ preview.internal ? 'internal' : 'external' }}</span>
+            <a :href="preview.url" target="_blank" rel="noopener">{{ preview.value }}</a>
+          </div>
+          <template v-if="preview.kind === 'url' && !preview.internal">
+            <div v-if="unfurl.loading" class="hint">Loading link preview…</div>
+            <a
+              v-else-if="unfurl.data && (unfurl.data.title || unfurl.data.image)"
+              class="unfurl-card"
+              :href="preview.url"
+              target="_blank"
+              rel="noopener"
+            >
+              <img v-if="unfurl.data.image" :src="unfurl.data.image" alt="" />
+              <div class="unfurl-text">
+                <div v-if="unfurl.data.siteName" class="unfurl-site">{{ unfurl.data.siteName }}</div>
+                <div v-if="unfurl.data.title" class="unfurl-title">{{ unfurl.data.title }}</div>
+                <div v-if="unfurl.data.description" class="unfurl-desc">{{ unfurl.data.description }}</div>
+              </div>
+            </a>
+          </template>
+          <div v-if="preview.kind === 'multiline'" class="sp-multiline">{{ preview.value }}</div>
+        </div>
+
+        <!-- Structural operations -->
+        <div class="insp-ops" v-if="selPath.length">
+          <template v-if="parentIsArray">
+            <div class="op-group">
+              <button class="btn op" @click="moveItem(-1)" :disabled="tipIndex === 0" title="Move up">↑</button>
+              <button class="btn op" @click="moveItem(1)" :disabled="tipIndex === parentLength - 1" title="Move down">↓</button>
+              <button class="btn op" @click="duplicateItem">⧉ Duplicate</button>
+              <button class="btn op danger" @click="deleteNode">✕ Delete item</button>
+            </div>
+          </template>
+
+          <template v-else>
+            <div class="op-group">
+              <button class="btn op danger" @click="deleteNode">✕ Delete key</button>
+            </div>
+          </template>
+        </div>
+      </aside>
+    </div>
+
+    <!-- Raw view -->
+    <div v-if="view === 'raw'" class="raw-wrap">
+      <div class="raw-toolbar">
+        <span v-if="rawError" class="raw-error">⚠ {{ rawError }}</span>
+        <span v-else class="raw-ok">✓ valid JSON</span>
+        <div class="raw-actions">
+          <button class="btn ghost" @click="formatRaw" :disabled="!!rawError">Format</button>
+          <button class="btn op" @click="applyRaw" :disabled="!!rawError || !rawohanged">Apply to document</button>
+        </div>
+      </div>
+      <div class="raw-editor-wrap">
+        <pre v-if="rawHighlight !== null" class="raw-highlight" ref="rawHl" v-html="rawHighlight"></pre>
+        <textarea
+          class="raw-editor"
+          :class="{ plain: rawHighlight === null }"
+          v-model="rawText"
+          spellcheck="false"
+          @scroll="syncRawScroll"
+          ref="rawTa"
+        ></textarea>
+      </div>
+    </div>
+  </main>
+
+  <!-- ===== Search modal ===== -->
+  <div v-if="searchOpen" class="modal-scrim" @click.self="searchOpen = false">
+    <div class="modal search-modal">
+      <input
+        ref="searchInput"
+        v-model="searchQuery"
+        class="search-input"
+        placeholder="Search keys, values and paths across all files…"
+        @keydown.down.prevent="searchSel = Math.min(searchSel + 1, searchResults.length - 1)"
+        @keydown.up.prevent="searchSel = Math.max(searchSel - 1, 0)"
+        @keydown.enter="gotoResult(searchResults[searchSel])"
+        @keydown.esc="searchOpen = false"
+        spellcheck="false"
+      />
+      <div class="search-results">
+        <button
+          v-for="(r, i) in searchResults"
+          :key="i"
+          class="search-result"
+          :class="{ sel: i === searchSel }"
+          @mouseenter="searchSel = i"
+          @click="gotoResult(r)"
+        >
+          <span class="sr-file">{{ shortName(r.file) }}</span>
+          <span class="sr-path">{{ r.pathLabel }}</span>
+          <span class="sr-value">{{ r.valuePreview }}</span>
+        </button>
+        <div v-if="searchQuery && !searchResults.length" class="search-empty">No matches</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Diff / save modal ===== -->
+  <div v-if="diffOpen" class="modal-scrim" @click.self="diffOpen = false">
+    <div class="modal diff-modal">
+      <div class="modal-title">
+        Save <strong>{{ active }}</strong>
+        <span class="diff-stats"><span class="add">+{{ diffAdds }}</span> <span class="del">−{{ diffDels }}</span></span>
+      </div>
+      <div class="diff-body">
+        <template v-for="(hunk, hi) in diffHunks" :key="hi">
+          <div class="hunk-sep" v-if="hi > 0">⋯</div>
+          <div v-for="(line, li) in hunk" :key="li" class="diff-line" :class="line.kind">
+            <span class="diff-gutter">{{ line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : ' ' }}</span>{{ line.text }}
+          </div>
+        </template>
+        <div v-if="!diffHunks.length" class="search-empty">No changes</div>
+      </div>
+      <div class="modal-actions">
+        <span class="hint">Files are versioned with git - use git to revert if needed.</span>
+        <button class="btn ghost" @click="diffOpen = false">Cancel</button>
+        <button class="btn save" @click="confirmSave" :disabled="saving">{{ saving ? 'Saving…' : 'Save file' }}</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== oontext menu ===== -->
+  <!-- @click.stop: clicks inside must not reach the window's close-on-outside-click listener;
+       with trusted events Vue re-renders mid-bubble and the clicked button detaches, which
+       would make it look like an outside click -->
+  <div v-if="ctxMenu.open" class="ctx-menu" :style="{ left: ctxMenu.x + 'px', top: ctxMenu.y + 'px' }" @click.stop>
+    <template v-if="ctxMenu.mode === 'main'">
+      <button class="ctx-item" @click="ctxDuplicate">⧉ Duplicate {{ parentIsArray ? 'item' : 'key' }}</button>
+      <button v-if="ctxCanDupInto" class="ctx-item" @click="ctxMenu.mode = 'into'">⤷ Duplicate into…</button>
+      <button class="ctx-item" @click="ctxCopyValue">Copy value</button>
+      <button class="ctx-item" @click="ctxCopyPath">Copy path</button>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item danger" @click="ctxDelete">✕ Delete “{{ ctxLabel }}”</button>
+    </template>
+    <template v-else>
+      <div class="ctx-header">Copy “{{ ctxKeyName }}” into:</div>
+      <div class="ctx-list">
+        <button v-for="s in ctxSiblings" :key="s.i" class="ctx-item" @click="dupIntoSibling(s.i)">{{ s.label }}</button>
+        <div v-if="!ctxSiblings.length" class="ctx-header">No sibling items</div>
+      </div>
+      <div class="ctx-sep"></div>
+      <button class="ctx-item" @click="ctxMenu.mode = 'main'">‹ Back</button>
+    </template>
+  </div>
+
+  <!-- ===== Toasts ===== -->
+  <div class="toasts">
+    <div v-for="t in toasts" :key="t.id" class="toast" :class="t.kind">{{ t.msg }}</div>
+  </div>
+</div>
+
+<script src="/vendor/vue.js"></script>
+<script src="/app.js"></script>
+</body>
+</html>

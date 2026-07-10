@@ -1,0 +1,8 @@
+{
+  "dataDir": "data/json",
+  "publicDir": "public",
+  "logo": null,
+  "logoLight": null,
+  "title": "JotSON",
+  "labelFields": ["title", "label", "name", "id"]
+}
