@@ -1,5 +1,5 @@
 {
-  "name": "jotson",
+  "name": "@blindmikey/jotson",
   "version": "1.0.0",
   "description": "Zero-dependency, drop-in editor for a project's JSON data files",
   "type": "module",
@@ -19,6 +19,6 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Blindmikey/jotson.git"
+    "url": "git+https://github.com/blindmikey/jotson.git"
   }
 }

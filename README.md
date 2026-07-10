@@ -4,13 +4,17 @@ A lightweight and intuitive editor for your project's JSON.
 Column-based navigation, smart previews (images, videos, dates, colors, URLs), full
 structural editing with undo/redo, fuzzy search, a raw JSON view, and diff-confirmed saves.
 
-## NPX usage
+## Install
 
-Navigate to your project then run:
+Install once globally, then run `jotson` in any project:
 
 ```bash
-npx jotson
+npm i -g @blindmikey/jotson
+cd your-project
+jotson
 ```
+
+Prefer zero-install? `npx @blindmikey/jotson` works too.
 
 ## Drop-in usage
 
