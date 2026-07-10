@@ -3,9 +3,22 @@
   "version": "1.0.0",
   "description": "Zero-dependency, drop-in editor for a project's JSON data files",
   "type": "module",
-  "bin": { "jotson": "bin/jotson.mjs" },
-  "files": ["bin", "server.mjs", "public", "vendor", "jotson.config.example.json"],
-  "engines": { "node": ">=18" },
+  "bin": {
+    "jotson": "bin/jotson.mjs"
+  },
+  "files": [
+    "bin",
+    "server.mjs",
+    "public",
+    "vendor",
+    "jotson.config.example.json"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "license": "MIT",
-  "repository": "github:Blindmikey/jotson"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Blindmikey/jotson.git"
+  }
 }
