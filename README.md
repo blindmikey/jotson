@@ -6,6 +6,8 @@
     </picture>
     <div><a href="https://www.npmjs.com/package/@blindmikey/jotson"><img alt="npm" src="https://img.shields.io/npm/v/%40blindmikey%2Fjotson?label=npm&color=6d78f2"></a></div>
     <h2>A lightweight and intuitive editor for your project's JSON.</h2>
+    <div><a href='https://ko-fi.com/G0G2231VF9' target='_blank'><img height='36' style='border:0px;height:36px;' src='https://storage.ko-fi.com/cdn/kofi3.png?v=6' border='0' alt='Buy Me a Coffee at ko-fi.com' /></a></div>
+    <div><span>&nbsp;</span></div>
 </div>
 
 <div align="center">
