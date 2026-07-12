@@ -732,10 +732,13 @@ createApp({
     window.addEventListener('beforeunload', (e) => {
       if (Object.values(this.dirtyMap).some(Boolean)) e.preventDefault()
     })
-    // Close the settings popover on any click outside it (the ⚙ button handles its own toggle)
     window.addEventListener('click', (e) => {
       // Clicks inside the context menu are handled by its items (the submenu must survive them)
       if (!e.target.closest('.ctx-menu')) this.ctxMenu.open = false
+    })
+    // Close the settings popover when a press STARTS outside it. Keyed to mousedown, not
+    // click: selecting text in a settings input and releasing outside must not dismiss it
+    window.addEventListener('mousedown', (e) => {
       if (!this.settingsOpen) return
       if (e.target.closest('.settings-pop') || e.target.closest('button[title="Settings"]')) return
       this.closeSettings()

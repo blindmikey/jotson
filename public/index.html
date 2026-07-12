@@ -20,7 +20,9 @@
         :alt="config.title"
       />
       <span v-else-if="config.title" class="brand-title">{{ config.title }}</span>
-      <span v-else><span class="brand-bracket">{</span>J<span class="brand-ot">𝘰𝓉</span>SON<span class="brand-bracket">}</span></span>
+      <!-- No logo and no title: jotson's own wordmark, theme-matched (served from the tool's public dir) -->
+      <!-- <span v-else class="brand-title"><span class="brand-bracket">{</span>J<span class="brand-ot">𝘰𝓉</span>SON<span class="brand-bracket">}</span></span> -->
+      <img v-else class="brand-logo" :src="theme === 'light' ? '/jotson-logo-light.png' : '/jotson-logo.png'" alt="JotSON" />
     </div>
 
     <nav class="file-tabs">
@@ -418,7 +420,7 @@
   </main>
 
   <!-- ===== Search modal ===== -->
-  <div v-if="searchOpen" class="modal-scrim" @click.self="searchOpen = false">
+  <div v-if="searchOpen" class="modal-scrim" @mousedown.self="searchOpen = false">
     <div class="modal search-modal">
       <input
         ref="searchInput"
@@ -450,7 +452,7 @@
   </div>
 
   <!-- ===== Reference picker modal ===== -->
-  <div v-if="refPicker.open" class="modal-scrim" @click.self="refPicker.open = false">
+  <div v-if="refPicker.open" class="modal-scrim" @mousedown.self="refPicker.open = false">
     <div class="modal search-modal">
       <input
         ref="refPickerInput"
@@ -491,7 +493,7 @@
   </div>
 
   <!-- ===== Diff / save modal ===== -->
-  <div v-if="diffOpen" class="modal-scrim" @click.self="diffOpen = false">
+  <div v-if="diffOpen" class="modal-scrim" @mousedown.self="diffOpen = false">
     <div class="modal diff-modal">
       <div class="modal-title">
         Save <strong>{{ active }}</strong>
