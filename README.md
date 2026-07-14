@@ -25,9 +25,10 @@
 - **File uploads** - point a key at local media, or upload straight from the editor:
   files land in your configured upload directory as collision-proof UUIDs and the
   site-relative path is stored. Includes unused-upload cleanup and directory migration.
-- **References** - string ids that resolve to objects across *all* your files: resolved
-  labels in columns, a searchable picker, "referenced by" backlinks, and integrity guards
-  that offer to update or clean references when ids are renamed or objects deleted.
+- **References** (opt-in) - string ids that resolve to objects across *all* your files:
+  resolved labels in columns, a searchable picker, "referenced by" backlinks, and integrity
+  guards that offer to update or clean references when ids are renamed or objects deleted.
+  Enable in ⚙️ when your ids are globally unique.
 - **Full structural editing** - add/rename/reorder/duplicate/delete keys and items,
   auto-generated UUID ids, per-file undo/redo, and an inline fields overview per object.
 - **Safe saves** - every save shows a line diff for confirmation, preserves line endings
@@ -76,6 +77,7 @@ tool's folder also works if no project-root config exists.
   "logoLight": "/assets/images/logo_alt.svg",
   "title": "My Project",
   "labelFields": ["title", "label", "name", "id"],
+  "references": true,
   "idFields": ["id"]
 }
 ```
@@ -89,6 +91,7 @@ tool's folder also works if no project-root config exists.
 | `logoLight` | Optional logo variant for the light theme (e.g. dark-text version) | `null` (reuses `logo` on a dark chip) |
 | `title` | Text brand fallback and window title | JotSON wordmark |
 | `labelFields` | Priority-ordered fields used to name objects in columns/breadcrumbs | see above |
+| `references` | Opt-in id-based reference detection. Leave off for datasets whose ids aren't globally unique (e.g. per-file incrementing numbers), which would show spurious references. Unavailable in projects with files over 20 MB | `false` |
 | `idFields` | Field names that identify objects as reference targets | `["id"]` |
 
 All of this is also editable in-app via the ⚙️ panel (directory changes are validated
@@ -98,6 +101,9 @@ above apply and the first ⚙️ save creates `jotson.config.json` in your proje
 ### Notes
 
 - Binds to `127.0.0.1` only; intended as a local dev tool, never a deployed service.
+- Built to stay responsive on multi-MB files: huge collections render in capped windows
+  with "show more", value edits are recorded as deltas for undo, and dirty checking runs
+  debounced off the typing path.
 - Saves are validated (must parse as JSON), shown as a line diff for confirmation first, and
   preserve each file's existing CRLF/LF line endings for minimal version-control noise.
 - There is deliberately no backup system, the assumption is your data files live in git.

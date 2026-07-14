@@ -92,6 +92,9 @@ const CONFIG_DEFAULTS = {
   title: '',
   labelFields: ['title', 'label', 'name', 'id'],
   idFields: ['id'],
+  // Opt-in: reference detection is data-driven, so datasets with non-unique ids would
+  // show spurious references out of the box
+  references: false,
 }
 
 // Internal branding - not part of the per-project config
@@ -311,6 +314,7 @@ async function handleApi(req, res, url) {
         const fields = body.idFields.map((f) => String(f).trim()).filter(Boolean)
         next.idFields = fields.length ? fields : CONFIG_DEFAULTS.idFields
       }
+      if (typeof body.references === 'boolean') next.references = body.references
       if (!(await isDirectory(path.resolve(ROOT, next.dataDir)))) {
         return sendJson(res, 400, { error: `Data directory not found: ${next.dataDir}` })
       }
@@ -486,9 +490,11 @@ async function handleApi(req, res, url) {
     const filePath = path.join(dataDir(), name)
 
     if (req.method === 'GET') {
+      // Raw text, not a JSON envelope: wrapping a 100 MB file in {"text": ...} would
+      // force the client to JSON-parse the whole payload twice
       try {
         const text = await fs.readFile(filePath, 'utf8')
-        return sendJson(res, 200, { name, text })
+        return send(res, 200, text, 'application/json; charset=utf-8')
       } catch {
         return sendJson(res, 404, { error: 'File not found' })
       }
@@ -501,22 +507,14 @@ async function handleApi(req, res, url) {
       } catch {
         return sendJson(res, 404, { error: 'File not found' })
       }
-      const body = await readBody(req)
-      let payload
+      // Body is the raw file text (same no-envelope reasoning as GET)
+      const text = await readBody(req)
       try {
-        payload = JSON.parse(body)
-      } catch {
-        return sendJson(res, 400, { error: 'Request body must be JSON' })
-      }
-      if (typeof payload.text !== 'string') {
-        return sendJson(res, 400, { error: 'Missing "text" field' })
-      }
-      try {
-        JSON.parse(payload.text)
+        JSON.parse(text)
       } catch (e) {
         return sendJson(res, 400, { error: `Refusing to save invalid JSON: ${e.message}` })
       }
-      await fs.writeFile(filePath, payload.text, 'utf8')
+      await fs.writeFile(filePath, text, 'utf8')
       return sendJson(res, 200, { ok: true })
     }
   }

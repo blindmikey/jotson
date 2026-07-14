@@ -5,5 +5,7 @@
   "logo": null,
   "logoLight": null,
   "title": "JotSON",
-  "labelFields": ["title", "label", "name", "id"]
+  "labelFields": ["title", "label", "name", "id"],
+  "references": false,
+  "idFields": ["id"]
 }

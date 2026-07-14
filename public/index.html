@@ -59,6 +59,15 @@
     </div>
   </header>
 
+  <!-- One-time notice (this release): references exist but default off -->
+  <div v-if="showRefsNotice" class="notice-bar">
+    <span>
+      🔗 <strong>New: references.</strong> Strings matching an object's id can resolve across files - off by default.
+      If your ids are globally unique, enable it in <button class="notice-link" @click="settingsOpen = true">⚙ settings</button>.
+    </span>
+    <button class="notice-x" @click="dismissRefsNotice" title="Dismiss">✕</button>
+  </div>
+
   <!-- ===== Settings popover ===== -->
   <div v-if="settingsOpen" class="settings-pop">
     <label>Data directory <span class="hint">(JSON files, relative to project root; empty = project root)</span></label>
@@ -90,8 +99,18 @@
     <input v-model="cfgDraft.title" spellcheck="false" placeholder="My Project" />
     <label>Label fields <span class="hint">(priority order for naming objects in columns &amp; breadcrumbs)</span></label>
     <input v-model="cfgDraft.labelFields" spellcheck="false" placeholder="title, label, name, urlSlug, theme, year, id" />
-    <label>Id fields <span class="hint">(field names that identify objects for references)</span></label>
-    <input v-model="cfgDraft.idFields" spellcheck="false" placeholder="id" />
+    <template v-if="!hugeProject">
+      <label class="cfg-check">
+        <input type="checkbox" v-model="cfgDraft.references" />
+        Enable references
+      </label>
+      <span class="hint cfg-check-hint">Strings matching an object's id resolve across files; enable only if ids are globally unique.</span>
+      <template v-if="cfgDraft.references">
+        <label>Id fields <span class="hint">(field names that identify objects for references)</span></label>
+        <input v-model="cfgDraft.idFields" spellcheck="false" placeholder="id" />
+      </template>
+    </template>
+    <span v-else class="hint cfg-check-hint">References are unavailable in this project - building the id index across files over 20 MB would freeze the app.</span>
     <div class="op-group">
       <button class="btn" :class="cfgDirty ? 'save' : 'op'" :disabled="cfgSaving || !cfgDirty" @click="saveConfig">
         {{ cfgSaving ? 'Saving…' : cfgDirty ? 'Save config •' : 'Save config' }}
@@ -112,6 +131,12 @@
     <span class="kbd-hints">Save <kbd>Ctrl+S</kbd> · Navigate <kbd>↑↓←→</kbd> · Sibling <kbd>Ctrl+↑/↓</kbd></span>
   </div>
 
+  <!-- Boot spinner: occupies the main slot until the first document renders. The
+       animation is transform-based so it keeps spinning while JSON.parse blocks JS. -->
+  <div v-if="booting && doc === undefined" class="boot-loading">
+    <span class="boot-spinner"></span>
+  </div>
+
   <!-- ===== Main ===== -->
   <main class="main" v-if="doc !== undefined">
 
@@ -119,8 +144,11 @@
     <div v-if="view === 'columns'" class="columns-wrap">
       <div class="columns" ref="columnsEl">
         <div v-for="(col, ci) in columns" :key="ci" class="column">
-          <div class="column-title">{{ col.title }} <span class="count">{{ col.entries.length }}</span></div>
+          <div class="column-title">{{ col.title }} <span class="count">{{ col.total }}</span></div>
           <div class="column-scroll">
+            <button v-if="col.hiddenBefore > 0" class="cell more-cell" @click="showEarlierRows(col)" title="Rows are windowed for performance - Ctrl+K searches everything, shown or not">
+              ⋯ Show earlier <span class="cell-preview">{{ col.hiddenBefore.toLocaleString() }} above</span>
+            </button>
             <button
               v-for="entry in col.entries"
               :key="entry.key"
@@ -134,7 +162,10 @@
               <span class="cell-preview">{{ entry.preview }}</span>
               <span v-if="entry.type === 'object' || entry.type === 'array'" class="cell-arrow">›</span>
             </button>
-            <div v-if="!col.entries.length" class="empty-col">empty {{ col.type }}</div>
+            <button v-if="col.hidden > 0" class="cell more-cell" @click="showMoreRows(col)" title="Rows are windowed for performance - Ctrl+K searches everything, shown or not">
+              ⋯ Show more <span class="cell-preview">{{ col.hidden.toLocaleString() }} hidden</span>
+            </button>
+            <div v-if="!col.total" class="empty-col">empty {{ col.type }}</div>
             <input
               v-if="addingKeyAt === ci"
               ref="inlineKeyInput"
@@ -187,7 +218,7 @@
         <div class="insp-row type-switch" v-if="selPath.length">
           <label>Type</label>
           <select :value="selected.type" @change="changeType($event)">
-            <option v-for="t in ['string','color','date','datetime','file','reference','number','boolean','null','object','array']" :key="t" :value="t">{{ t }}</option>
+            <option v-for="t in typeOptions" :key="t" :value="t">{{ t }}</option>
           </select>
           <span v-if="selected.type === 'object' || selected.type === 'array'" class="type-count">
             {{ selected.type === 'array'
@@ -359,38 +390,39 @@
           <div v-if="!reverseRefs.refs.length" class="hint">Nothing references this object yet.</div>
         </div>
 
-        <!-- Object fields: every key editable inline with previews, hr-delimited -->
-        <div v-if="selected.type === 'object' && Object.keys(selected.value).length" class="obj-fields">
+        <!-- Object fields: every key editable inline with previews, hr-delimited (capped for huge objects) -->
+        <div v-if="objFields" class="obj-fields">
           <hr class="of-rule" />
           <div class="sp-title">Fields</div>
-          <template v-for="(fv, fk, fi) in selected.value" :key="fk">
+          <template v-for="(f, fi) in objFields.entries" :key="f.k">
             <hr v-if="fi > 0" class="of-rule" />
             <div class="obj-field">
-              <button class="of-key" @click="selPath = [...selPath, fk]" :title="'Open ' + fk">
-                <span class="cell-type" :class="'t-' + fieldType(fv, fk)">{{ typeGlyph(fieldType(fv, fk)) }}</span>
-                <span class="of-name">{{ fk }}</span>
+              <button class="of-key" @click="selPath = [...selPath, f.k]" :title="'Open ' + f.k">
+                <span class="cell-type" :class="'t-' + fieldType(f.v, f.k)">{{ typeGlyph(fieldType(f.v, f.k)) }}</span>
+                <span class="of-name">{{ f.k }}</span>
               </button>
               <div class="of-value">
-                <span v-if="typeof fv === 'string' && idFieldsList.includes(fk)" class="of-readonly" :title="'View-only here - open ' + fk + ' to edit it'">{{ fv }}</span>
-                <template v-else-if="['string','date','datetime','color','file'].includes(fieldType(fv, fk))">
-                  <span v-if="fieldType(fv, fk) === 'color'" class="swatch of-swatch" :style="{ background: fv }"></span>
-                  <textarea v-if="String(fv).includes('\n')" class="of-input" rows="2" :value="fv" @change="setFieldValue(fk, $event.target.value)" spellcheck="false"></textarea>
-                  <input v-else class="of-input" :value="fv" @change="setFieldValue(fk, $event.target.value)" spellcheck="false" />
+                <span v-if="typeof f.v === 'string' && idFieldsList.includes(f.k)" class="of-readonly" :title="'View-only here - open ' + f.k + ' to edit it'">{{ f.v }}</span>
+                <template v-else-if="['string','date','datetime','color','file'].includes(fieldType(f.v, f.k))">
+                  <span v-if="fieldType(f.v, f.k) === 'color'" class="swatch of-swatch" :style="{ background: f.v }"></span>
+                  <textarea v-if="String(f.v).includes('\n')" class="of-input" rows="2" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false"></textarea>
+                  <input v-else class="of-input" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false" />
                 </template>
-                <input v-else-if="fieldType(fv, fk) === 'number'" class="of-input" type="number" step="any" :value="fv" @change="setFieldValue(fk, $event.target.value === '' ? 0 : Number($event.target.value))" />
-                <div v-else-if="fieldType(fv, fk) === 'boolean'" class="bool-toggle of-bool">
-                  <button :class="{ on: fv === true }" @click="setFieldValue(fk, true)">true</button>
-                  <button :class="{ on: fv === false }" @click="setFieldValue(fk, false)">false</button>
+                <input v-else-if="fieldType(f.v, f.k) === 'number'" class="of-input" type="number" step="any" :value="f.v" @change="setFieldValue(f.k, $event.target.value === '' ? 0 : Number($event.target.value))" />
+                <div v-else-if="fieldType(f.v, f.k) === 'boolean'" class="bool-toggle of-bool">
+                  <button :class="{ on: f.v === true }" @click="setFieldValue(f.k, true)">true</button>
+                  <button :class="{ on: f.v === false }" @click="setFieldValue(f.k, false)">false</button>
                 </div>
-                <span v-else-if="fieldType(fv, fk) === 'null'" class="null-note">null</span>
-                <button v-else-if="fieldType(fv, fk) === 'reference'" class="of-container" @click="selPath = [...selPath, fk]">→ {{ refTargetLabel(fv) }}</button>
-                <button v-else class="of-container" @click="selPath = [...selPath, fk]">{{ entryPreview(fv, fieldType(fv, fk)) }} ›</button>
+                <span v-else-if="fieldType(f.v, f.k) === 'null'" class="null-note">null</span>
+                <button v-else-if="fieldType(f.v, f.k) === 'reference'" class="of-container" @click="selPath = [...selPath, f.k]">→ {{ refTargetLabel(f.v) }}</button>
+                <button v-else class="of-container" @click="selPath = [...selPath, f.k]">{{ entryPreview(f.v, fieldType(f.v, f.k)) }} ›</button>
               </div>
-              <div v-if="fieldType(fv, fk) === 'file' && isImgPath(fv)" class="smart-preview">
-                <img :src="resolveUrl(fv)" alt="" />
+              <div v-if="fieldType(f.v, f.k) === 'file' && isImgPath(f.v)" class="smart-preview">
+                <img :src="resolveUrl(f.v)" alt="" />
               </div>
             </div>
           </template>
+          <div v-if="objFields.hidden > 0" class="hint">+ {{ objFields.hidden.toLocaleString() }} more fields - browse them in the columns.</div>
         </div>
       </aside>
     </div>
@@ -422,17 +454,20 @@
   <!-- ===== Search modal ===== -->
   <div v-if="searchOpen" class="modal-scrim" @mousedown.self="searchOpen = false">
     <div class="modal search-modal">
-      <input
-        ref="searchInput"
-        v-model="searchQuery"
-        class="search-input"
-        placeholder="Search keys, values and paths across all files…"
-        @keydown.down.prevent="searchSel = Math.min(searchSel + 1, searchResults.length - 1)"
-        @keydown.up.prevent="searchSel = Math.max(searchSel - 1, 0)"
-        @keydown.enter="gotoResult(searchResults[searchSel])"
-        @keydown.esc="searchOpen = false"
-        spellcheck="false"
-      />
+      <div class="search-input-row">
+        <input
+          ref="searchInput"
+          v-model="searchQuery"
+          class="search-input"
+          placeholder="Search keys, values and paths across all files…"
+          @keydown.down.prevent="searchSel = Math.min(searchSel + 1, searchResults.length - 1)"
+          @keydown.up.prevent="searchSel = Math.max(searchSel - 1, 0)"
+          @keydown.enter="gotoResult(searchResults[searchSel])"
+          @keydown.esc="searchOpen = false"
+          spellcheck="false"
+        />
+        <span v-if="!searchIndex || searching" class="search-spinner" :title="!searchIndex ? 'Indexing…' : 'Searching…'"></span>
+      </div>
       <div class="search-results">
         <button
           v-for="(r, i) in searchResults"
@@ -446,7 +481,7 @@
           <span class="sr-path">{{ r.pathLabel }}</span>
           <span class="sr-value">{{ r.valuePreview }}</span>
         </button>
-        <div v-if="searchQuery && !searchResults.length" class="search-empty">No matches</div>
+        <div v-if="searchTerm && !searchResults.length && !searching" class="search-empty">{{ searchIndex ? 'No matches' : 'Indexing…' }}</div>
       </div>
     </div>
   </div>
@@ -500,18 +535,23 @@
         <span class="diff-stats"><span class="add">+{{ diffAdds }}</span> <span class="del">−{{ diffDels }}</span></span>
       </div>
       <div class="diff-body">
+        <div v-if="diffPreparing" class="hint diff-toobig">Preparing diff…</div>
+        <div v-if="diffTooBig" class="hint diff-toobig">
+          This diff is too large to display ({{ (diffAdds + diffDels).toLocaleString() }} changed lines - often the
+          one-time pretty-print normalization of a hand-formatted file). Saving writes the complete pretty-printed document.
+        </div>
         <template v-for="(hunk, hi) in diffHunks" :key="hi">
           <div class="hunk-sep" v-if="hi > 0">⋯</div>
           <div v-for="(line, li) in hunk" :key="li" class="diff-line" :class="line.kind">
             <span class="diff-gutter">{{ line.kind === 'add' ? '+' : line.kind === 'del' ? '−' : ' ' }}</span>{{ line.text }}
           </div>
         </template>
-        <div v-if="!diffHunks.length" class="search-empty">No changes</div>
+        <div v-if="!diffHunks.length && !diffTooBig && !diffPreparing" class="search-empty">No changes</div>
       </div>
       <div class="modal-actions">
         <span class="hint">Files are versioned with git - use git to revert if needed.</span>
         <button class="btn ghost" @click="diffOpen = false">Cancel</button>
-        <button class="btn save" @click="confirmSave" :disabled="saving">{{ saving ? 'Saving…' : 'Save file' }}</button>
+        <button class="btn save" @click="confirmSave" :disabled="saving || diffPreparing">{{ saving ? 'Saving…' : diffPreparing ? 'Preparing…' : 'Save file' }}</button>
       </div>
     </div>
   </div>

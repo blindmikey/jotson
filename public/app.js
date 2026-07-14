@@ -5,6 +5,13 @@ const { createApp } = Vue
 
 const DEFAULT_LABEL_FIELDS = ['title', 'label', 'name', 'id']
 const DEFAULT_ID_FIELDS = ['id']
+// Above this on-disk size a file counts as "huge": the exact dirty verify (a full
+// stringify) is skipped, the raw view is blocked, and undo memory is byte-budgeted
+const HUGE_FILE_BYTES = 20 * 1024 * 1024
+const SNAPSHOT_BUDGET_BYTES = 256 * 1024 * 1024
+// Columns render at most this many rows before a "show more" tail - huge collections
+// would otherwise build hundreds of thousands of DOM nodes and stall every re-render
+const COL_RENDER_CAP = 500
 const JOTSON_BRAND = '{J𝘰𝓉SON}' // internal branding - not part of the per-project config
 const IMG_RE = /\.(png|jpe?g|webp|gif|svg|avif)(\?.*)?$/i
 const VID_RE = /\.(mp4|webm|mov|ogg)(\?.*)?$/i
@@ -55,6 +62,32 @@ function vimeoEmbed(v) {
 }
 
 const unfurlCache = new Map()
+
+/* Yield to the event loop between work slices without setTimeout's nested-timer clamp */
+const yieldChannel = new MessageChannel()
+let yieldCallback = null
+yieldChannel.port1.onmessage = () => {
+  const cb = yieldCallback
+  yieldCallback = null
+  if (cb) cb()
+}
+function yieldToBrowser(cb) {
+  yieldCallback = cb
+  yieldChannel.port2.postMessage(null)
+}
+
+/* Run cb after the next paint - with a timer fallback, since rAF never fires in
+   backgrounded tabs and the work must still happen there */
+function afterPaint(cb) {
+  let done = false
+  const run = () => {
+    if (done) return
+    done = true
+    cb()
+  }
+  requestAnimationFrame(() => requestAnimationFrame(run))
+  setTimeout(run, 150)
+}
 
 function relTime(d) {
   const diff = d.getTime() - Date.now()
@@ -207,23 +240,8 @@ function highlightJson(text) {
   return out + '\n'
 }
 
-/* Line diff: trim common prefix/suffix, LCS on the middle when affordable. */
-function diffLines(aText, bText) {
-  const a = aText.split('\n')
-  const b = bText.split('\n')
-  let start = 0
-  while (start < a.length && start < b.length && a[start] === b[start]) start++
-  let endA = a.length
-  let endB = b.length
-  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
-    endA--
-    endB--
-  }
-  const midA = a.slice(start, endA)
-  const midB = b.slice(start, endB)
-  const ops = []
-  for (let i = 0; i < start; i++) ops.push({ kind: 'same', text: a[i] })
-
+/* Diff the changed middle window (after prefix/suffix trim) into ops */
+function midDiffOps(midA, midB, ops) {
   if (midA.length * midB.length <= 400000) {
     // LCS dynamic programming
     const n = midA.length
@@ -253,9 +271,54 @@ function diffLines(aText, bText) {
     for (const line of midA) ops.push({ kind: 'del', text: line })
     for (const line of midB) ops.push({ kind: 'add', text: line })
   }
+}
 
+function splitTrimmed(aText, bText) {
+  const a = aText.split('\n')
+  const b = bText.split('\n')
+  // A missing final newline on one side would block the suffix trim entirely, turning
+  // a one-line edit into a whole-file diff - normalize the trailing empty line away
+  if (a[a.length - 1] === '' || b[b.length - 1] === '') {
+    if (a[a.length - 1] === '') a.pop()
+    if (b[b.length - 1] === '') b.pop()
+  }
+  let start = 0
+  while (start < a.length && start < b.length && a[start] === b[start]) start++
+  let endA = a.length
+  let endB = b.length
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--
+    endB--
+  }
+  return { a, b, start, endA, endB }
+}
+
+/* Line diff: trim common prefix/suffix, LCS on the middle when affordable. */
+function diffLines(aText, bText) {
+  const { a, b, start, endA, endB } = splitTrimmed(aText, bText)
+  const ops = []
+  for (let i = 0; i < start; i++) ops.push({ kind: 'same', text: a[i] })
+  midDiffOps(a.slice(start, endA), b.slice(start, endB), ops)
   for (let i = endA; i < a.length; i++) ops.push({ kind: 'same', text: a[i] })
   return ops
+}
+
+/* Huge-file variant: never materializes an op per unchanged line (a one-line edit in a
+   6M-line file must not allocate 6M objects) - returns counts plus a windowed op list
+   with a few context lines, ready for buildHunks */
+function diffLinesWindowed(aText, bText, ctx = 3) {
+  const { a, b, start, endA, endB } = splitTrimmed(aText, bText)
+  const ops = []
+  for (let i = Math.max(0, start - ctx); i < start; i++) ops.push({ kind: 'same', text: a[i] })
+  midDiffOps(a.slice(start, endA), b.slice(start, endB), ops)
+  for (let i = endA; i < Math.min(a.length, endA + ctx); i++) ops.push({ kind: 'same', text: a[i] })
+  let adds = 0
+  let dels = 0
+  for (const o of ops) {
+    if (o.kind === 'add') adds++
+    else if (o.kind === 'del') dels++
+  }
+  return { adds, dels, ops }
 }
 
 /* Group diff ops into hunks with `ctx` lines of context around changes. */
@@ -294,6 +357,7 @@ createApp({
     return {
       files: [],
       active: '',
+      booting: true, // drives the centered load spinner until the first doc renders
       store: {}, // name -> { doc, diskText, prettyBase }
       dirtyMap: {},
       selPath: [],
@@ -316,7 +380,10 @@ createApp({
       rawBase: '',
       // search
       searchOpen: false,
-      searchQuery: '',
+      searchQuery: '', // the input's live value
+      searchTerm: '', // what results are computed from - debounced behind searchQuery on big indexes
+      searchResults: [], // filled by the chunked, cancellable scan in runSearch
+      searching: false,
       searchSel: 0,
       searchIndex: null,
       // diff/save
@@ -337,6 +404,7 @@ createApp({
       configPath: 'jotson.config.json',
       version: null,
       update: null, // { latest, command } when a newer version is on npm
+      refsNoticeDismissed: localStorage.getItem('cms.refsNotice') === '1',
       uploading: false,
       fileTypeOverride: null, // "file:path" of a string manually switched to the file type
       mediaScan: null, // { loading, orphans: [{name,size,mtime}] } - unused-uploads scan state
@@ -344,7 +412,11 @@ createApp({
       refIndex: null, // { targets: Map<id, [{file,path,label,field}]>, referrers: Map<id, [{file,path}]> }
       refTypeOverride: null, // "file:path" of a string manually switched to the reference type
       refPicker: { open: false, query: '', collection: null, sel: 0 },
-      cfgDraft: { dataDir: '', publicDir: '', uploadDir: '', logo: '', logoLight: '', title: '', labelFields: '', idFields: '' },
+      colLimits: {}, // "<file>|<column path>" -> extra rows granted via "show more"
+      colStarts: {}, // "<file>|<column path>" -> window start granted via "show earlier"
+      diffTooBig: false,
+      diffPreparing: false,
+      cfgDraft: { dataDir: '', publicDir: '', uploadDir: '', logo: '', logoLight: '', title: '', labelFields: '', idFields: '', references: false },
       cfgSaving: false,
       labelFields: DEFAULT_LABEL_FIELDS,
       toasts: [],
@@ -372,6 +444,58 @@ createApp({
       return this.config.idFields && this.config.idFields.length ? this.config.idFields : DEFAULT_ID_FIELDS
     },
 
+    /* Any loaded file over the huge threshold - some features are gated off at scale */
+    hugeProject() {
+      for (const f of this.files) {
+        const s = this.store[f.name]
+        if (s && s.diskText.length > HUGE_FILE_BYTES) return true
+      }
+      return false
+    },
+
+    /* References are per-project opt-IN: projects with non-unique ids (e.g. per-file
+       incrementing numbers) would otherwise show spurious cross-file references.
+       Force-disabled in huge projects: the id index build is synchronous and would
+       block for seconds (or exhaust memory) on 100 MB-class files */
+    refsEnabled() {
+      return this.config.references === true && !this.hugeProject
+    },
+
+    /* One-time heads-up (this release): references now exist but default off */
+    showRefsNotice() {
+      return this.files.length > 0 && !this.refsEnabled && !this.refsNoticeDismissed && !this.hugeProject
+    },
+
+    typeOptions() {
+      return [
+        'string',
+        'color',
+        'date',
+        'datetime',
+        'file',
+        ...(this.refsEnabled ? ['reference'] : []),
+        'number',
+        'boolean',
+        'null',
+        'object',
+        'array'
+      ]
+    },
+
+    /* Field rows for the inspector's object overview, capped - a huge object (like a
+       34k-key root) must not render tens of thousands of input rows */
+    objFields() {
+      if (!this.selected || typeOf(this.selected.value) !== 'object') return null
+      const v = this.selected.value
+      const keys = Object.keys(v)
+      if (!keys.length) return null
+      const shown = keys.slice(0, 100)
+      return {
+        entries: shown.map((k) => ({ k, v: v[k] })),
+        hidden: keys.length - shown.length
+      }
+    },
+
     /* The selected node is a string under an idFields key (identity, not reference) */
     isIdKey() {
       if (!this.selected || !this.selPath.length) return false
@@ -389,6 +513,7 @@ createApp({
 
     /* When an id-bearing object is selected: everything that references it */
     reverseRefs() {
+      if (!this.refsEnabled) return null
       if (!this.selected || typeOf(this.selected.value) !== 'object') return null
       let id = null
       for (const f of this.idFieldsList) {
@@ -495,7 +620,8 @@ createApp({
         (d.logoLight || '') !== (c.logoLight || '') ||
         d.title !== c.title ||
         JSON.stringify(draftFields) !== JSON.stringify(c.labelFields || []) ||
-        JSON.stringify(draftIdFields) !== JSON.stringify(c.idFields || DEFAULT_ID_FIELDS)
+        JSON.stringify(draftIdFields) !== JSON.stringify(c.idFields || DEFAULT_ID_FIELDS) ||
+        d.references !== (c.references === true)
       )
     },
 
@@ -507,9 +633,26 @@ createApp({
         const t = typeOf(node)
         if (t !== 'object' && t !== 'array') break
         const title = d === 0 ? this.active : this.segLabel(this.selPath[d - 1], d - 1)
+        const keys = t === 'array' ? null : Object.keys(node)
+        const total = t === 'array' ? node.length : keys.length
+        // Render a window of rows, not everything: positioned around the selection when
+        // it sits deep in the collection (search jumps to row 400k must not render 400k
+        // cells), expandable both ways via the "show earlier / show more" tail cells
+        const limitKey = this.active + '|' + this.selPath.slice(0, d).join('.')
+        const winLen = COL_RENDER_CAP + (this.colLimits[limitKey] || 0)
+        let winStart = this.colStarts[limitKey] || 0
+        const selSeg = d < this.selPath.length ? this.selPath[d] : undefined
+        if (selSeg !== undefined) {
+          const selIdx = t === 'array' ? (typeof selSeg === 'number' ? selSeg : -1) : keys.indexOf(selSeg)
+          if (selIdx >= 0 && (selIdx < winStart || selIdx >= winStart + winLen)) {
+            winStart = Math.max(0, selIdx - 100)
+          }
+        }
+        const winEnd = Math.min(total, winStart + winLen)
         const entries = []
         if (t === 'array') {
-          node.forEach((v, i) => {
+          for (let i = winStart; i < winEnd; i++) {
+            const v = node[i]
             let vt = displayType(v)
             if (vt === 'string' && this.isRefString(v, i)) vt = 'reference'
             const fl = friendlyLabel(v, this.labelFields)
@@ -534,9 +677,10 @@ createApp({
                     ? `[${i}]`
                     : this.entryPreview(v, vt)
             })
-          })
+          }
         } else {
-          for (const k of Object.keys(node)) {
+          for (let i = winStart; i < winEnd; i++) {
+            const k = keys[i]
             const v = node[k]
             let vt = displayType(v)
             if (vt === 'string' && this.isRefString(v, k)) vt = 'reference'
@@ -548,7 +692,16 @@ createApp({
             })
           }
         }
-        cols.push({ title: truncate(title, 30), type: t, entries })
+        cols.push({
+          title: truncate(title, 30),
+          type: t,
+          entries,
+          total,
+          hiddenBefore: winStart,
+          hidden: total - winEnd,
+          winStart,
+          limitKey
+        })
         if (d < this.selPath.length) {
           node = node[this.selPath[d]]
           if (node === undefined) break
@@ -567,7 +720,7 @@ createApp({
       if (type === 'string' && this.fileTypeOverride === this.active + ':' + this.selPath.join('/')) type = 'file'
       // Data-driven reference detection: a string equal to a known id (except under an
       // idFields key, which is an identity, not a reference); dropdown override pre-pick
-      if (type === 'string' && this.selPath.length) {
+      if (this.refsEnabled && type === 'string' && this.selPath.length) {
         const key = this.selPath[this.selPath.length - 1]
         if (this.isRefString(v, key) || this.refTypeOverride === this.active + ':' + this.selPath.join('/')) type = 'reference'
       }
@@ -652,36 +805,28 @@ createApp({
       return highlightJson(this.rawText)
     },
 
-    searchResults() {
-      const q = this.searchQuery.trim().toLowerCase()
-      if (!q || !this.searchIndex) return []
-      const tokens = q.split(/\s+/)
-      const scored = []
-      for (const entry of this.searchIndex) {
-        let score = 0
-        let ok = true
-        for (const tok of tokens) {
-          if (entry.key.includes(tok)) score += 5
-          else if (entry.val.includes(tok)) score += 3
-          else if (entry.pathStr.includes(tok)) score += 2
-          else {
-            ok = false
-            break
-          }
-        }
-        if (ok) scored.push({ score, entry })
-      }
-      scored.sort((x, y) => y.score - x.score)
-      return scored.slice(0, 50).map((s) => s.entry)
-    }
   },
 
   watch: {
     preview(p) {
       this.scheduleUnfurl(p)
     },
-    searchQuery() {
-      this.searchSel = 0
+    // Keystrokes land in the input instantly; the scan runs after a short pause on big
+    // indexes (and the scan itself is chunked, so it never blocks continued typing)
+    searchQuery(q) {
+      clearTimeout(this._searchDebounce)
+      const big = this.searchIndex && this.searchIndex.length > 20000
+      if (!big) {
+        this.searchTerm = q
+        return
+      }
+      this._searchDebounce = setTimeout(() => {
+        this.searchTerm = q
+      }, 180)
+    },
+
+    searchTerm(q) {
+      this.runSearch(q)
     },
     selPath() {
       this.syncRename()
@@ -714,10 +859,15 @@ createApp({
       deep: true,
       handler() {
         if (!this._navRestoring && history.state) history.replaceState(this.navState(), '')
-        // Any navigation keeps the right-most (newest) column in view
+        // Any navigation keeps the right-most (newest) column in view, and each
+        // column scrolled to its on-path cell (search jumps can select row 20,000)
         this.$nextTick(() => {
           const el = this.$refs.columnsEl
-          if (el) el.scrollLeft = el.scrollWidth
+          if (!el) return
+          el.scrollLeft = el.scrollWidth
+          for (const cell of el.querySelectorAll('.cell.selected, .cell.tip')) {
+            cell.scrollIntoView({ block: 'nearest' })
+          }
         })
       }
     },
@@ -791,23 +941,46 @@ createApp({
       })
     } catch (e) {
       this.toast('Failed to load: ' + e.message, 'error')
+    } finally {
+      this.booting = false
     }
   },
 
   methods: {
     /* ---------- loading / files ---------- */
     async loadFile(name) {
-      const { text } = await api('/api/files/' + encodeURIComponent(name))
+      const res = await fetch('/api/files/' + encodeURIComponent(name))
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.error || `${res.status} ${res.statusText}`)
+      }
+      const text = await res.text()
       // Normalize to LF internally; remember the file's EOL style to preserve it on save.
       // Strip a UTF-8 BOM if present (JSON.parse rejects it; saves are written without one).
       const eol = text.includes('\r\n') ? '\r\n' : '\n'
       const lfText = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
       const doc = JSON.parse(lfText)
-      this.store[name] = { doc, diskText: lfText, prettyBase: serialize(doc), eol }
+      // prettyBase (the pretty-printed on-disk baseline) is computed on first need -
+      // it costs a full stringify, which large files shouldn't pay at boot
+      this.store[name] = { doc, diskText: lfText, prettyBase: null, eol }
       this.dirtyMap[name] = false
       if (!this.undoStacks[name]) this.undoStacks[name] = { undo: [], redo: [] }
+      this.invalidateIndexes()
+    },
+
+    /* Drop both derived indexes and abandon any in-flight chunked build or scan */
+    invalidateIndexes() {
       this.searchIndex = null
       this.refIndex = null
+      if (this._indexBuild) {
+        this._indexBuild.cancelled = true
+        this._indexBuild = null
+      }
+      if (this._searchScan) {
+        this._searchScan.cancelled = true
+        this._searchScan = null
+        this.searching = false
+      }
     },
 
     openFile(name) {
@@ -829,11 +1002,30 @@ createApp({
       return !!this.dirtyMap[name]
     },
 
+    /* Cheap provisional dirty (an edit almost always dirties the doc); the exact check
+       is a full pretty-print of the document, so it runs debounced after the burst */
     refreshDirty() {
-      const s = this.store[this.active]
-      if (s) this.dirtyMap[this.active] = serialize(s.doc) !== s.prettyBase
-      this.searchIndex = null
-      this.refIndex = null
+      const name = this.active
+      if (this.store[name]) {
+        this.dirtyMap[name] = true
+        clearTimeout(this._dirtyTimer)
+        this._dirtyTimer = setTimeout(() => this.verifyDirty(name), 700)
+      }
+      this.invalidateIndexes()
+    },
+
+    verifyDirty(name) {
+      const s = this.store[name]
+      if (!s) return
+      // Huge files keep the provisional flag: the exact check costs a full stringify
+      // (seconds at 100 MB). Worst case is a spurious dirty dot after undoing everything.
+      if (s.diskText.length > HUGE_FILE_BYTES) return
+      this.dirtyMap[name] = serialize(s.doc) !== this.prettyBaseOf(s)
+    },
+
+    prettyBaseOf(s) {
+      if (s.prettyBase === null) s.prettyBase = serialize(JSON.parse(s.diskText))
+      return s.prettyBase
     },
 
     /* ---------- columns / selection ---------- */
@@ -981,8 +1173,52 @@ createApp({
       }
       stacks.undo.push(JSON.stringify(this.store[this.active].doc))
       if (stacks.undo.length > 100) stacks.undo.shift()
+      this.trimSnapshots(stacks.undo)
       stacks.redo = []
       this.lastSnap = { key: coalesceKey ? this.active + '|' + coalesceKey : '', time: now }
+    },
+
+    /* Drop the oldest snapshots when the stack's full-doc strings exceed the byte
+       budget - a 100 MB doc would otherwise hoard gigabytes within a few operations */
+    trimSnapshots(stack) {
+      let bytes = 0
+      for (let i = stack.length - 1; i >= 0; i--) {
+        const e = stack[i]
+        bytes += typeof e === 'string' ? e.length * 2 : 512
+        if (bytes > SNAPSHOT_BUDGET_BYTES && i > 0) {
+          stack.splice(0, i)
+          return
+        }
+      }
+    },
+
+    /* Value edits record just {path, old value} instead of stringifying the whole doc -
+       on large files a full snapshot per keystroke burst costs hundreds of ms and MBs */
+    snapshotLeaf(path, coalesceKey) {
+      const stacks = this.undoStacks[this.active]
+      const now = Date.now()
+      if (coalesceKey && this.lastSnap.key === this.active + '|' + coalesceKey && now - this.lastSnap.time < 900) {
+        this.lastSnap.time = now
+        return
+      }
+      stacks.undo.push({ p: [...path], v: clone(getNode(this.store[this.active].doc, path)) })
+      if (stacks.undo.length > 100) stacks.undo.shift()
+      stacks.redo = []
+      this.lastSnap = { key: coalesceKey ? this.active + '|' + coalesceKey : '', time: now }
+    },
+
+    /* Undo entries are either full-doc JSON strings (structural ops) or {p, v} leaf
+       records (value edits) - apply one to the store and return its inverse */
+    applySnapEntry(s, entry) {
+      if (typeof entry === 'string') {
+        const inverse = JSON.stringify(s.doc)
+        s.doc = JSON.parse(entry)
+        return inverse
+      }
+      const inverse = { p: entry.p, v: clone(getNode(s.doc, entry.p)) }
+      const parent = getNode(s.doc, entry.p.slice(0, -1))
+      if (parent !== undefined && parent !== null) parent[entry.p[entry.p.length - 1]] = entry.v
+      return inverse
     },
 
     /* Trim the selection back to the nearest ancestor that still exists. */
@@ -995,8 +1231,8 @@ createApp({
     undo() {
       const stacks = this.undoStacks[this.active]
       if (!stacks || !stacks.undo.length) return
-      stacks.redo.push(JSON.stringify(this.store[this.active].doc))
-      this.store[this.active].doc = JSON.parse(stacks.undo.pop())
+      stacks.redo.push(this.applySnapEntry(this.store[this.active], stacks.undo.pop()))
+      this.trimSnapshots(stacks.redo)
       this.lastSnap = { key: '', time: 0 }
       this.sanitizeSelPath()
       this.refreshDirty()
@@ -1006,8 +1242,8 @@ createApp({
     redo() {
       const stacks = this.undoStacks[this.active]
       if (!stacks || !stacks.redo.length) return
-      stacks.undo.push(JSON.stringify(this.store[this.active].doc))
-      this.store[this.active].doc = JSON.parse(stacks.redo.pop())
+      stacks.undo.push(this.applySnapEntry(this.store[this.active], stacks.redo.pop()))
+      this.trimSnapshots(stacks.undo)
       this.lastSnap = { key: '', time: 0 }
       this.sanitizeSelPath()
       this.refreshDirty()
@@ -1023,7 +1259,7 @@ createApp({
       if (typeof tailKey === 'string' && this.idFieldsList.includes(tailKey) && typeof v === 'string') {
         this.trackIdRenameAt(this.selPath)
       }
-      this.snapshot('value:' + this.selPath.join('/'))
+      this.snapshotLeaf(this.selPath, 'value:' + this.selPath.join('/'))
       const parent = getNode(this.doc, this.selPath.slice(0, -1))
       parent[tailKey] = v
       this.refreshDirty()
@@ -1038,6 +1274,7 @@ createApp({
     },
 
     trackIdRenameAt(path) {
+      if (!this.refsEnabled) return
       const pathKey = this.active + ':' + path.join('/')
       let p = this._idRename
       if (!p || p.pathKey !== pathKey) {
@@ -1093,10 +1330,9 @@ createApp({
             updated++
           }
         }
-        this.dirtyMap[file] = serialize(fs.doc) !== fs.prettyBase
+        this.dirtyMap[file] = serialize(fs.doc) !== this.prettyBaseOf(fs)
       }
-      this.searchIndex = null
-      this.refIndex = null
+      this.invalidateIndexes()
       this.lastSnap = { key: '', time: 0 }
       this.toast(`Updated ${updated} reference${updated === 1 ? '' : 's'} to "${newId}"`)
     },
@@ -1117,7 +1353,7 @@ createApp({
       const obj = getNode(this.doc, this.selPath)
       if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return
       if (this.idFieldsList.includes(key) && typeof v === 'string') this.trackIdRenameAt([...this.selPath, key])
-      this.snapshot('field:' + this.selPath.join('/') + '/' + key)
+      this.snapshotLeaf([...this.selPath, key], 'field:' + this.selPath.join('/') + '/' + key)
       obj[key] = v
       this.refreshDirty()
     },
@@ -1172,7 +1408,7 @@ createApp({
       else if (t === 'null') v = null
       else if (t === 'object') v = {}
       else v = []
-      this.snapshot()
+      this.snapshotLeaf(this.selPath) // type conversion is still just a value swap at one path
       const parent = getNode(this.doc, this.selPath.slice(0, -1))
       parent[this.selPath[this.selPath.length - 1]] = v
       this.refreshDirty()
@@ -1227,6 +1463,7 @@ createApp({
     },
 
     isRefString(v, key) {
+      if (!this.refsEnabled) return false
       if (typeof v !== 'string' || !v) return false
       if (typeof key === 'string' && this.idFieldsList.includes(key)) return false
       return this.getRefIndex().targets.has(v)
@@ -1272,6 +1509,11 @@ createApp({
 
     refPathFull(file, path) {
       return this.shortName(file) + ' › ' + this.refPathSegs(file, path).join(' › ')
+    },
+
+    dismissRefsNotice() {
+      this.refsNoticeDismissed = true
+      localStorage.setItem('cms.refsNotice', '1')
     },
 
     openRefPicker() {
@@ -1379,6 +1621,15 @@ createApp({
       } finally {
         this.uploading = false
       }
+    },
+
+    showMoreRows(col) {
+      this.colLimits[col.limitKey] = (this.colLimits[col.limitKey] || 0) + COL_RENDER_CAP
+    },
+
+    showEarlierRows(col) {
+      this.colStarts[col.limitKey] = Math.max(0, col.winStart - COL_RENDER_CAP)
+      this.colLimits[col.limitKey] = (this.colLimits[col.limitKey] || 0) + COL_RENDER_CAP
     },
 
     addItemAt(ci) {
@@ -1572,7 +1823,7 @@ createApp({
       }
       collect(node)
       const refs = []
-      if (ids.size) {
+      if (ids.size && this.refsEnabled) {
         const seen = new Set()
         for (const id of ids) {
           for (const r of this.getRefIndex().referrers.get(id) || []) {
@@ -1660,7 +1911,7 @@ createApp({
             }
           }
         }
-        if (file !== this.active) this.dirtyMap[file] = serialize(s.doc) !== s.prettyBase
+        if (file !== this.active) this.dirtyMap[file] = serialize(s.doc) !== this.prettyBaseOf(s)
       }
       return removed
     },
@@ -1713,6 +1964,13 @@ createApp({
     /* ---------- raw view ---------- */
     setView(v) {
       if (v === this.view) return
+      if (v === 'raw') {
+        const s = this.store[this.active]
+        if (s && s.diskText.length > HUGE_FILE_BYTES) {
+          this.toast('Raw view is disabled for very large files - the columns stay fast at any size', 'error')
+          return
+        }
+      }
       if (v !== 'raw' && this.rawohanged && !this.rawError) {
         if (window.confirm('Apply raw edits to the document?')) this.applyRaw()
       }
@@ -1774,43 +2032,121 @@ createApp({
     },
 
     /* ---------- search ---------- */
-    buildSearchIndex() {
-      const index = []
+    /* Build the search index in time-sliced chunks so the palette can open instantly -
+       the pause before the user types hides most of the cost, and typing stays smooth
+       even while indexing a multi-MB document */
+    ensureSearchIndex() {
+      if (this.searchIndex || this._indexBuild) return
+      const build = { cancelled: false, index: [] }
+      this._indexBuild = build
+      const stack = []
       for (const f of this.files) {
         const s = this.store[f.name]
-        if (!s) continue
-        const walk = (node, path) => {
-          const t = typeOf(node)
+        if (s) stack.push({ n: s.doc, p: [], f: f.name })
+      }
+      const step = () => {
+        if (build.cancelled) return
+        const t0 = performance.now()
+        while (stack.length && performance.now() - t0 < 20) {
+          const { n, p, f } = stack.pop()
+          const t = typeOf(n)
           if (t === 'object') {
-            for (const k of Object.keys(node)) walk(node[k], [...path, k])
+            for (const k of Object.keys(n)) stack.push({ n: n[k], p: [...p, k], f })
           } else if (t === 'array') {
-            node.forEach((v, i) => walk(v, [...path, i]))
+            for (let i = 0; i < n.length; i++) stack.push({ n: n[i], p: [...p, i], f })
           } else {
-            const key = path.length ? String(path[path.length - 1]) : ''
-            const pathLabel = path
-              .map((seg) => (typeof seg === 'number' ? `[${seg}]` : seg))
-              .join(' › ')
-            index.push({
-              file: f.name,
-              path,
+            const key = p.length ? String(p[p.length - 1]) : ''
+            const pathLabel = p.map((seg) => (typeof seg === 'number' ? `[${seg}]` : seg)).join(' › ')
+            const sv = String(n)
+            build.index.push({
+              file: f,
+              path: p,
               pathLabel,
               key: key.toLowerCase(),
-              val: String(node).toLowerCase(),
+              // Cap indexed value text: long strings would otherwise duplicate the whole
+              // document's bytes into the index (search matches within the first 200 chars)
+              val: (sv.length > 200 ? sv.slice(0, 200) : sv).toLowerCase(),
               pathStr: pathLabel.toLowerCase(),
-              valuePreview: truncate(String(node), 80)
+              valuePreview: truncate(sv, 80)
             })
           }
         }
-        walk(s.doc, [])
+        if (stack.length) {
+          yieldToBrowser(step) // MessageChannel: yields without setTimeout's ~4ms clamp
+        } else {
+          this._indexBuild = null
+          this.searchIndex = build.index
+          if (this.searchTerm) this.runSearch(this.searchTerm) // query typed while indexing
+        }
       }
-      this.searchIndex = index
+      step()
     },
 
     openSearch() {
-      if (!this.searchIndex) this.buildSearchIndex()
       this.searchOpen = true
       this.searchSel = 0
       this.$nextTick(() => this.$refs.searchInput && this.$refs.searchInput.focus())
+      this.ensureSearchIndex()
+    },
+
+    /* Time-sliced, cancellable scan: keystrokes must never wait on it. Ranking uses
+       score buckets (scores are small ints) so no full sort of the match set is needed */
+    runSearch(rawQuery) {
+      if (this._searchScan) this._searchScan.cancelled = true
+      this._searchScan = null
+      const q = rawQuery.trim().toLowerCase()
+      if (!q || !this.searchIndex) {
+        this.searchResults = []
+        this.searching = false
+        return
+      }
+      const tokens = q.split(/\s+/)
+      const idx = this.searchIndex
+      const scan = { cancelled: false }
+      this._searchScan = scan
+      this.searching = true
+      const buckets = new Map() // score -> up to 50 entries
+      let i = 0
+      const step = () => {
+        if (scan.cancelled) return
+        const t0 = performance.now()
+        for (; i < idx.length && performance.now() - t0 < 12; i++) {
+          const entry = idx[i]
+          let score = 0
+          let ok = true
+          for (const tok of tokens) {
+            if (entry.key.includes(tok)) score += 5
+            else if (entry.val.includes(tok)) score += 3
+            else if (entry.pathStr.includes(tok)) score += 2
+            else {
+              ok = false
+              break
+            }
+          }
+          if (ok) {
+            let b = buckets.get(score)
+            if (!b) buckets.set(score, (b = []))
+            if (b.length < 50) b.push(entry)
+          }
+        }
+        if (i < idx.length) {
+          yieldToBrowser(step)
+          return
+        }
+        const out = []
+        for (const sc of [...buckets.keys()].sort((a, b) => b - a)) {
+          for (const e of buckets.get(sc)) {
+            out.push(e)
+            if (out.length === 50) break
+          }
+          if (out.length === 50) break
+        }
+        this._searchScan = null
+        this.searching = false
+        this.searchResults = out
+        this.searchSel = 0
+      }
+      step()
     },
 
     gotoResult(r) {
@@ -1824,12 +2160,38 @@ createApp({
       if (!this.isDirty(this.active)) return
       if (this.view === 'raw' && this.rawohanged && !this.rawError) this.applyRaw()
       const s = this.store[this.active]
-      this.pendingSaveText = serialize(s.doc)
-      const ops = diffLines(s.diskText, this.pendingSaveText)
-      this.diffHunks = buildHunks(ops)
-      this.diffAdds = ops.filter((o) => o.kind === 'add').length
-      this.diffDels = ops.filter((o) => o.kind === 'del').length
+      // Open the modal in a "preparing" state first: serializing + diffing a huge doc
+      // takes seconds, and the block should happen behind visible feedback, not a freeze
+      this.diffPreparing = true
+      this.diffHunks = []
+      this.diffAdds = 0
+      this.diffDels = 0
+      this.diffTooBig = false
       this.diffOpen = true
+      afterPaint(() => {
+        if (!this.diffOpen) {
+          this.diffPreparing = false // dismissed while preparing
+          return
+        }
+        this.pendingSaveText = serialize(s.doc)
+        if (s.diskText.length > HUGE_FILE_BYTES) {
+          // Windowed diff: counts + hunk-ready ops without allocating per unchanged line
+          const { adds, dels, ops } = diffLinesWindowed(s.diskText, this.pendingSaveText)
+          this.diffAdds = adds
+          this.diffDels = dels
+          this.diffTooBig = adds + dels > 5000
+          this.diffHunks = this.diffTooBig ? [] : buildHunks(ops)
+        } else {
+          const ops = diffLines(s.diskText, this.pendingSaveText)
+          this.diffAdds = ops.filter((o) => o.kind === 'add').length
+          this.diffDels = ops.filter((o) => o.kind === 'del').length
+          // Rendering an enormous diff (e.g. first-save normalization of a huge file)
+          // would build hundreds of thousands of DOM rows - show the summary instead
+          this.diffTooBig = this.diffAdds + this.diffDels > 5000
+          this.diffHunks = this.diffTooBig ? [] : buildHunks(ops)
+        }
+        this.diffPreparing = false
+      })
     },
 
     async confirmSave() {
@@ -1840,7 +2202,7 @@ createApp({
         await api('/api/files/' + encodeURIComponent(this.active), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ text: outText })
+          body: outText // raw text - no envelope to double-parse on either end
         })
         s.diskText = this.pendingSaveText
         s.prettyBase = this.pendingSaveText
@@ -1889,7 +2251,8 @@ createApp({
         logoLight: config.logoLight || '',
         title: config.title,
         labelFields: (config.labelFields || DEFAULT_LABEL_FIELDS).join(', '),
-        idFields: (config.idFields || DEFAULT_ID_FIELDS).join(', ')
+        idFields: (config.idFields || DEFAULT_ID_FIELDS).join(', '),
+        references: config.references === true
       }
     },
 
@@ -2012,10 +2375,9 @@ createApp({
           }
         }
         walk(s.doc)
-        if (touched) this.dirtyMap[f.name] = serialize(s.doc) !== s.prettyBase
+        if (touched) this.dirtyMap[f.name] = serialize(s.doc) !== this.prettyBaseOf(s)
       }
-      this.searchIndex = null
-      this.refIndex = null
+      this.invalidateIndexes()
       return updated
     },
 
