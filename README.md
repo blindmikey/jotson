@@ -1,8 +1,8 @@
 <div align="center">
     <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/blindmikey/jotson/main/docs/jotson.png">
-        <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/blindmikey/jotson/main/docs/jotson-light.png">
-        <img alt="JotSON" src="https://raw.githubusercontent.com/blindmikey/jotson/main/docs/jotson-w-bg.png">
+        <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/blindmikey/jotson/main/docs/jotson.svg">
+        <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/blindmikey/jotson/main/docs/jotson-light.svg">
+        <img alt="JotSON" height="64" src="https://raw.githubusercontent.com/blindmikey/jotson/main/docs/jotson-w-bg.svg">
     </picture>
     <div><a href="https://www.npmjs.com/package/@blindmikey/jotson"><img alt="npm" src="https://img.shields.io/npm/v/%40blindmikey%2Fjotson?label=npm&color=6d78f2"></a></div>
     <h2>A lightweight and intuitive editor for your project's JSON.</h2>

@@ -551,6 +551,7 @@ createApp({
       refsNoticeDismissed: localStorage.getItem('cms.refsNotice') === '1',
       uploading: false,
       fileTypeOverride: null, // "file:path" of a string manually switched to the file type
+      ofUploadKey: null, // Fields-overview key an upload was requested for (shared hidden input)
       mediaScan: null, // { loading, orphans: [{name,size,mtime}] } - unused-uploads scan state
       // References: id index across all loaded files, rebuilt lazily after edits
       refIndex: null, // { targets: Map<id, [{file,path,label,field}]>, referrers: Map<id, [{file,path}]> }
@@ -1021,16 +1022,13 @@ createApp({
       deep: true,
       handler() {
         if (!this._navRestoring && history.state) history.replaceState(this.navState(), '')
+        // Persist EVERY selection change (debounced) - arrow keys, breadcrumbs, and
+        // sibling switches assign selPath directly and never pass through persistNav
+        clearTimeout(this._persistTimer)
+        this._persistTimer = setTimeout(() => this.persistNav(), 300)
         // Any navigation keeps the right-most (newest) column in view, and each
         // column scrolled to its on-path cell (search jumps can select row 20,000)
-        this.$nextTick(() => {
-          const el = this.$refs.columnsEl
-          if (!el) return
-          el.scrollLeft = el.scrollWidth
-          for (const cell of el.querySelectorAll('.cell.selected, .cell.tip')) {
-            cell.scrollIntoView({ block: 'nearest' })
-          }
-        })
+        this.$nextTick(() => this.scrollSelectionIntoView())
       }
     },
     active() {
@@ -1105,6 +1103,17 @@ createApp({
       this.toast('Failed to load: ' + e.message, 'error')
     } finally {
       this.booting = false
+      // Settle pass for the restored selection: the watcher's scroll runs while the
+      // columns are still populating, so a selected container's child column (which
+      // renders later) would sit just out of view. Re-snap on DOM growth, briefly.
+      this.$nextTick(() => {
+        this.scrollSelectionIntoView(true)
+        const el = this.$refs.columnsEl
+        if (!el) return
+        const mo = new MutationObserver(() => this.scrollSelectionIntoView(true))
+        mo.observe(el, { childList: true, subtree: true })
+        setTimeout(() => mo.disconnect(), 3000)
+      })
     }
   },
 
@@ -1193,9 +1202,22 @@ createApp({
     verifyDirty(name) {
       const s = this.store[name]
       if (!s) return
-      // Huge files keep the provisional flag: the exact check costs a full stringify
-      // (seconds at 100 MB). Worst case is a spurious dirty dot after undoing everything.
-      if (s.diskText.length > HUGE_FILE_BYTES) return
+      if (s.diskText.length > HUGE_FILE_BYTES) {
+        // Journal-based exact check, O(edits): clean when every edited path is back at
+        // its first-touch original. Structural ops keep the provisional flag (paths may
+        // have shifted, and a full stringify at this size is exactly what we avoid).
+        if (s.journal && !s.journal.structural) {
+          let dirty = false
+          for (const { p, old } of s.journal.paths.values()) {
+            if (JSON.stringify(getNode(s.doc, p)) !== JSON.stringify(old)) {
+              dirty = true
+              break
+            }
+          }
+          this.dirtyMap[name] = dirty
+        }
+        return
+      }
       this.dirtyMap[name] = serialize(s.doc) !== this.prettyBaseOf(s)
     },
 
@@ -1535,6 +1557,21 @@ createApp({
       return typeof v === 'string' && IMG_RE.test(v)
     },
 
+    /* Per-value twins of the selected-node computeds (colorHex6/dtLocalValue/dtSuffix),
+       for the Fields overview where each row has its own value */
+    hex6Of(v) {
+      return toHex6(v)
+    },
+
+    dtLocalOf(v) {
+      return String(v).slice(0, 16)
+    },
+
+    dtSuffixOf(v) {
+      const s = String(v)
+      return s.length > 16 ? s.slice(16) : ''
+    },
+
     /* Inline edit of a key on the selected object (Fields section) */
     setFieldValue(key, v) {
       const obj = getNode(this.doc, this.selPath)
@@ -1718,6 +1755,28 @@ createApp({
 
     /* Teleporting navigation (search results, reference links). Pushes a history entry
        so browser back returns to where you jumped from. */
+    /* instant=true bypasses the CSS smooth scroll: restore-time snaps must land
+       immediately (smooth animations need animation frames, which throttled tabs never
+       get, and rapid re-snaps would cancel each other's animations). The vertical nudge
+       is computed per column scroller - scrollIntoView would also drag the horizontal
+       ancestor back toward the leftmost path cell, undoing the snap-right. */
+    scrollSelectionIntoView(instant = false) {
+      const el = this.$refs.columnsEl
+      if (!el) return
+      const behavior = instant ? 'instant' : 'smooth'
+      for (const cell of el.querySelectorAll('.cell.selected, .cell.tip')) {
+        const scroller = cell.closest('.column-scroll')
+        if (!scroller) continue
+        const cr = cell.getBoundingClientRect()
+        const sr = scroller.getBoundingClientRect()
+        let delta = 0
+        if (cr.top < sr.top) delta = cr.top - sr.top
+        else if (cr.bottom > sr.bottom) delta = cr.bottom - sr.bottom
+        if (delta) scroller.scrollTo({ top: scroller.scrollTop + delta, behavior })
+      }
+      el.scrollTo({ left: el.scrollWidth, behavior })
+    },
+
     jumpTo(file, path) {
       if (!this.store[file]) return
       history.pushState(this.navState(), '')
@@ -1794,20 +1853,36 @@ createApp({
       return n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : n >= 1024 ? Math.round(n / 1024) + ' KB' : n + ' B'
     },
 
-    async uploadFile(e) {
+    async uploadTo(e, apply) {
       const f = e.target.files && e.target.files[0]
       e.target.value = '' // allow re-picking the same file
       if (!f || this.uploading) return
       this.uploading = true
       try {
         const { path } = await api('/api/upload?name=' + encodeURIComponent(f.name), { method: 'POST', body: f })
-        this.setValue(path)
+        apply(path)
         this.toast('Uploaded - stored as ' + path)
       } catch (err) {
         this.toast('Upload failed: ' + err.message, 'error')
       } finally {
         this.uploading = false
       }
+    },
+
+    uploadFile(e) {
+      return this.uploadTo(e, (path) => this.setValue(path))
+    },
+
+    /* Fields-overview upload: one hidden input serves every row; the clicked row's key
+       is parked in ofUploadKey so the async result lands on the right field */
+    ofPickUpload(key) {
+      this.ofUploadKey = key
+      this.$refs.ofFileInput && this.$refs.ofFileInput.click()
+    },
+
+    uploadFieldFile(e) {
+      const key = this.ofUploadKey
+      return this.uploadTo(e, (path) => this.setFieldValue(key, path))
     },
 
     showMoreRows(col) {

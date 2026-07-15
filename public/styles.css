@@ -447,6 +447,10 @@ body.resizing .columns { scroll-behavior: auto; }
 .of-key:hover .of-name { color: var(--text); text-decoration: underline; }
 .of-value { display: flex; align-items: flex-start; gap: 0.5rem; }
 .of-input { flex: 1; width: 100%; font-size: 0.8rem; }
+/* Compound editors (color/file) reused from the main inspector, scaled to overview rows */
+.of-typed { flex: 1; min-width: 0; gap: 0.35rem; }
+.of-typed input[type='color'] { width: 2.4rem; height: 1.85rem; }
+.of-typed .btn.op { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
 .of-swatch { width: 1.5rem; height: 1.5rem; border-radius: 4px; border: 1px solid var(--border); flex-shrink: 0; }
 .of-readonly { font-family: var(--mono); font-size: 0.78rem; color: var(--text-faint); word-break: break-all; padding: 0.2rem 0; }
 .of-container {

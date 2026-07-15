@@ -22,7 +22,7 @@
       <span v-else-if="config.title" class="brand-title">{{ config.title }}</span>
       <!-- No logo and no title: jotson's own wordmark, theme-matched (served from the tool's public dir) -->
       <!-- <span v-else class="brand-title"><span class="brand-bracket">{</span>J<span class="brand-ot">𝘰𝓉</span>SON<span class="brand-bracket">}</span></span> -->
-      <img v-else class="brand-logo" :src="theme === 'light' ? '/jotson-logo-light.png' : '/jotson-logo.png'" alt="JotSON" />
+      <img v-else class="brand-logo" :src="theme === 'light' ? '/jotson-logo-light.svg' : '/jotson-logo.svg'" alt="JotSON" />
     </div>
 
     <nav class="file-tabs">
@@ -399,8 +399,17 @@
               </button>
               <div class="of-value">
                 <span v-if="typeof f.v === 'string' && idFieldsList.includes(f.k)" class="of-readonly" :title="'View-only here - open ' + f.k + ' to edit it'">{{ f.v }}</span>
-                <template v-else-if="['string','date','datetime','color','file'].includes(fieldType(f.v, f.k))">
-                  <span v-if="fieldType(f.v, f.k) === 'color'" class="swatch of-swatch" :style="{ background: f.v }"></span>
+                <div v-else-if="fieldType(f.v, f.k) === 'color'" class="color-editor of-typed">
+                  <input type="color" :value="hex6Of(f.v)" @input="setFieldValue(f.k, $event.target.value)" title="Pick a color" />
+                  <input class="color-text of-input" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false" />
+                </div>
+                <input v-else-if="fieldType(f.v, f.k) === 'date'" class="date-editor of-input" type="date" :value="f.v" @input="$event.target.value && setFieldValue(f.k, $event.target.value)" />
+                <input v-else-if="fieldType(f.v, f.k) === 'datetime'" class="date-editor of-input" type="datetime-local" :value="dtLocalOf(f.v)" @input="$event.target.value && setFieldValue(f.k, $event.target.value + dtSuffixOf(f.v))" />
+                <div v-else-if="fieldType(f.v, f.k) === 'file'" class="file-editor of-typed">
+                  <input class="file-path of-input" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false" placeholder="/media/image.png" />
+                  <button class="btn op" :disabled="uploading" @click="ofPickUpload(f.k)" title="Upload a file into this field">{{ uploading && ofUploadKey === f.k ? '…' : '⇪' }}</button>
+                </div>
+                <template v-else-if="fieldType(f.v, f.k) === 'string'">
                   <textarea v-if="String(f.v).includes('\n')" class="of-input" rows="2" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false"></textarea>
                   <input v-else class="of-input" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false" />
                 </template>
@@ -419,6 +428,8 @@
             </div>
           </template>
           <div v-if="objFields.hidden > 0" class="hint">+ {{ objFields.hidden.toLocaleString() }} more fields - browse them in the columns.</div>
+          <!-- One hidden picker serves every row's ⇪; ofUploadKey routes the result -->
+          <input ref="ofFileInput" type="file" hidden @change="uploadFieldFile" />
         </div>
       </aside>
     </div>
