@@ -63,18 +63,20 @@ function vimeoEmbed(v) {
 
 const unfurlCache = new Map()
 
-/* Yield to the event loop between work slices without setTimeout's nested-timer clamp */
-const yieldChannel = new MessageChannel()
-let yieldCallback = null
-yieldChannel.port1.onmessage = () => {
-  const cb = yieldCallback
-  yieldCallback = null
-  if (cb) cb()
+/* Search-index paths are stored as shared trie nodes ({seg, up} chains) instead of one
+   array per entry - "reference, don't copy" is what keeps 100 MB-class indexes in memory */
+function triePath(t) {
+  const segs = []
+  for (let n = t; n; n = n.up) segs.push(n.seg)
+  return segs.reverse()
 }
-function yieldToBrowser(cb) {
-  yieldCallback = cb
-  yieldChannel.port2.postMessage(null)
+
+function trieLabel(t) {
+  return triePath(t)
+    .map((seg) => (typeof seg === 'number' ? `[${seg}]` : seg))
+    .join(' › ')
 }
+
 
 /* Run cb after the next paint - with a timer fallback, since rAF never fires in
    backgrounded tabs and the work must still happen there */
@@ -87,6 +89,20 @@ function afterPaint(cb) {
   }
   requestAnimationFrame(() => requestAnimationFrame(run))
   setTimeout(run, 150)
+}
+
+/* Schedule the next background work slice one frame away, so rendering (and the
+   user's keystrokes) always get their share of each frame; timer fallback keeps the
+   work moving in backgrounded tabs where rAF never fires */
+function nextSlice(cb) {
+  let done = false
+  const run = () => {
+    if (done) return
+    done = true
+    cb()
+  }
+  requestAnimationFrame(run)
+  setTimeout(run, 40)
 }
 
 function relTime(d) {
@@ -303,15 +319,143 @@ function diffLines(aText, bText) {
   return ops
 }
 
-/* Huge-file variant: never materializes an op per unchanged line (a one-line edit in a
-   6M-line file must not allocate 6M objects) - returns counts plus a windowed op list
-   with a few context lines, ready for buildHunks */
-function diffLinesWindowed(aText, bText, ctx = 3) {
-  const { a, b, start, endA, endB } = splitTrimmed(aText, bText)
+/* Pretty-print a fragment of minified JSON without parsing it: a token walk that
+   inserts newlines and relative indentation, string-safe. The fragment starts
+   mid-document so the depth is relative, but two fragments sharing a prefix indent
+   identically - which is all a diff needs to align */
+function prettifyFragment(s) {
+  let out = ''
+  let depth = 0
+  let inStr = false
+  const pad = () => '  '.repeat(Math.max(0, depth))
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i]
+    if (inStr) {
+      out += c
+      if (c === '\\') {
+        out += s[++i] || ''
+        continue
+      }
+      if (c === '"') inStr = false
+      continue
+    }
+    if (c === '"') {
+      inStr = true
+      out += c
+    } else if (c === '{' || c === '[') {
+      depth++
+      out += c + '\n' + pad()
+    } else if (c === '}' || c === ']') {
+      depth--
+      out += '\n' + pad() + c
+    } else if (c === ',') {
+      out += c + '\n' + pad()
+    } else if (c === ':') {
+      out += ': '
+    } else {
+      out += c
+    }
+  }
+  return out
+}
+
+/* Minified huge files: locate the changed region with a char scan (no full-document
+   pretty conversion - serialize + reparse + reserialize costs ~10s at 150 MB), then
+   fake a pretty diff by prettifying just the excerpts and line-diffing those */
+function diffCharsWindowed(aText, bText, ctx = 400) {
+  if (aText === bText) return { adds: 0, dels: 0, ops: [] }
+  const maxP = Math.min(aText.length, bText.length)
+  let p = 0
+  while (p < maxP && aText.charCodeAt(p) === bText.charCodeAt(p)) p++
+  let sfx = 0
+  const maxS = maxP - p
+  while (sfx < maxS && aText.charCodeAt(aText.length - 1 - sfx) === bText.charCodeAt(bText.length - 1 - sfx)) sfx++
+  const aRegion = aText.length - sfx - p
+  const bRegion = bText.length - sfx - p
+  // Widespread changes (first-save of oddly-formatted data, mass edits): summary only
+  if (aRegion > 100000 || bRegion > 100000) {
+    return { adds: bRegion, dels: aRegion, ops: [], units: 'characters' }
+  }
+  // Excerpt window; snap the start to a `,"` boundary so the tokenizer (very likely)
+  // starts outside a string - both texts share the prefix, so one snap fits both
+  let from = Math.max(0, p - ctx)
+  if (from > 0) {
+    const snap = aText.indexOf(',"', from)
+    if (snap !== -1 && snap < p) from = snap + 1
+  }
+  const aEnd = Math.min(aText.length, aText.length - sfx + ctx)
+  const bEnd = Math.min(bText.length, bText.length - sfx + ctx)
+  const prettyA = prettifyFragment(aText.slice(from, aEnd))
+  const prettyB = prettifyFragment(bText.slice(from, bEnd))
   const ops = []
-  for (let i = Math.max(0, start - ctx); i < start; i++) ops.push({ kind: 'same', text: a[i] })
-  midDiffOps(a.slice(start, endA), b.slice(start, endB), ops)
-  for (let i = endA; i < Math.min(a.length, endA + ctx); i++) ops.push({ kind: 'same', text: a[i] })
+  if (from > 0) ops.push({ kind: 'same', text: '…' })
+  ops.push(...diffLines(prettyA, prettyB))
+  if (aEnd < aText.length || bEnd < bText.length) ops.push({ kind: 'same', text: '…' })
+  let adds = 0
+  let dels = 0
+  for (const o of ops) {
+    if (o.kind === 'add') adds++
+    else if (o.kind === 'del') dels++
+  }
+  return { adds, dels, ops }
+}
+
+/* Huge-file variant: finds the changed region by CHARACTER scan (no line-splitting of
+   the full 160 MB texts - that alone costs seconds and two 6M-element arrays), widens
+   to line boundaries, and line-diffs only the differing window plus context */
+function diffLinesWindowed(aText, bText, ctx = 3) {
+  // Normalize the trailing-newline asymmetry (same reasoning as splitTrimmed)
+  const aNL = aText.endsWith('\n')
+  const bNL = bText.endsWith('\n')
+  if (aNL !== bNL) {
+    if (aNL) aText = aText.slice(0, -1)
+    else bText = bText.slice(0, -1)
+  }
+  if (aText === bText) return { adds: 0, dels: 0, ops: [] }
+  // common char prefix
+  const maxP = Math.min(aText.length, bText.length)
+  let p = 0
+  while (p < maxP && aText.charCodeAt(p) === bText.charCodeAt(p)) p++
+  // common char suffix, not overlapping the prefix
+  let s = 0
+  const maxS = maxP - p
+  while (s < maxS && aText.charCodeAt(aText.length - 1 - s) === bText.charCodeAt(bText.length - 1 - s)) s++
+  // widen to whole lines (prefix region is identical in both texts)
+  const lineStart = aText.lastIndexOf('\n', p - 1) + 1
+  let aEnd = aText.indexOf('\n', aText.length - s)
+  if (aEnd === -1) aEnd = aText.length
+  let bEnd = bText.indexOf('\n', bText.length - s)
+  if (bEnd === -1) bEnd = bText.length
+  const midAText = aText.slice(lineStart, aEnd)
+  const midBText = bText.slice(lineStart, bEnd)
+  // A changed region spanning a huge share of the file (e.g. first-save normalization):
+  // don't materialize millions of line ops - count newlines and let the summary render
+  if (midAText.length > 4000000 || midBText.length > 4000000) {
+    const countLines = (t) => {
+      if (!t.length) return 0
+      let n = 1
+      for (let i = t.indexOf('\n'); i !== -1; i = t.indexOf('\n', i + 1)) n++
+      return n
+    }
+    return { adds: countLines(midBText), dels: countLines(midAText), ops: [] }
+  }
+  const ops = []
+  // leading context lines
+  let cStart = lineStart
+  for (let i = 0; i < ctx && cStart > 0; i++) cStart = aText.lastIndexOf('\n', cStart - 2) + 1
+  if (cStart < lineStart) {
+    for (const line of aText.slice(cStart, lineStart - 1).split('\n')) ops.push({ kind: 'same', text: line })
+  }
+  midDiffOps(midAText.length ? midAText.split('\n') : [], midBText.length ? midBText.split('\n') : [], ops)
+  // trailing context lines
+  let cEnd = aEnd
+  for (let i = 0; i < ctx && cEnd < aText.length; i++) {
+    const nx = aText.indexOf('\n', cEnd + 1)
+    cEnd = nx === -1 ? aText.length : nx
+  }
+  if (cEnd > aEnd) {
+    for (const line of aText.slice(aEnd + 1, cEnd).split('\n')) ops.push({ kind: 'same', text: line })
+  }
   let adds = 0
   let dels = 0
   for (const o of ops) {
@@ -414,8 +558,10 @@ createApp({
       refPicker: { open: false, query: '', collection: null, sel: 0 },
       colLimits: {}, // "<file>|<column path>" -> extra rows granted via "show more"
       colStarts: {}, // "<file>|<column path>" -> window start granted via "show earlier"
+      pendingWriteText: '', // what confirmSave writes (minified for compact files)
       diffTooBig: false,
       diffPreparing: false,
+      diffUnits: 'lines', // 'characters' when a minified huge file diffs char-wise
       cfgDraft: { dataDir: '', publicDir: '', uploadDir: '', logo: '', logoLight: '', title: '', labelFields: '', idFields: '', references: false },
       cfgSaving: false,
       labelFields: DEFAULT_LABEL_FIELDS,
@@ -480,6 +626,21 @@ createApp({
         'object',
         'array'
       ]
+    },
+
+    /* Cached size label for the selected container. Must be a computed, not an inline
+       template expression: Object.keys on a 520k-key object costs ~700 ms, and template
+       expressions re-run on every root re-render (i.e. every keystroke anywhere) */
+    selectedSize() {
+      if (!this.selected) return ''
+      const v = this.selected.value
+      const t = typeOf(v)
+      if (t === 'array') return v.length + (v.length === 1 ? ' item' : ' items')
+      if (t === 'object') {
+        const n = Object.keys(v).length
+        return n + (n === 1 ? ' key' : ' keys')
+      }
+      return ''
     },
 
     /* Field rows for the inspector's object overview, capped - a huge object (like a
@@ -814,6 +975,7 @@ createApp({
     // Keystrokes land in the input instantly; the scan runs after a short pause on big
     // indexes (and the scan itself is chunked, so it never blocks continued typing)
     searchQuery(q) {
+      this._lastTyped = performance.now() // background slices back off while typing
       clearTimeout(this._searchDebounce)
       const big = this.searchIndex && this.searchIndex.length > 20000
       if (!big) {
@@ -961,8 +1123,22 @@ createApp({
       const lfText = text.replace(/^\uFEFF/, '').replace(/\r\n/g, '\n')
       const doc = JSON.parse(lfText)
       // prettyBase (the pretty-printed on-disk baseline) is computed on first need -
-      // it costs a full stringify, which large files shouldn't pay at boot
-      this.store[name] = { doc, diskText: lfText, prettyBase: null, eol }
+      // it costs a full stringify, which large files shouldn't pay at boot.
+      // compact: the file is minified (single line) - edits render pretty everywhere
+      // but saves write minified again, preserving the file's format
+      const compact = !lfText.trim().includes('\n')
+      this.store[name] = {
+        doc,
+        diskText: lfText,
+        prettyBase: null,
+        eol,
+        compact,
+        trailNL: /\n$/.test(lfText),
+        // Change journal: first-touch original value per edited path. Lets huge files
+        // diff in O(edits) instead of O(file). `structural` marks ops that can shift
+        // sibling paths (array splices etc.) - those fall back to the text diff.
+        journal: { paths: new Map(), structural: false }
+      }
       this.dirtyMap[name] = false
       if (!this.undoStacks[name]) this.undoStacks[name] = { undo: [], redo: [] }
       this.invalidateIndexes()
@@ -1175,6 +1351,9 @@ createApp({
       if (stacks.undo.length > 100) stacks.undo.shift()
       this.trimSnapshots(stacks.undo)
       stacks.redo = []
+      // Full snapshots are structural ops - the journal can't track shifted paths
+      const j = this.store[this.active].journal
+      if (j) j.structural = true
       this.lastSnap = { key: coalesceKey ? this.active + '|' + coalesceKey : '', time: now }
     },
 
@@ -1197,6 +1376,13 @@ createApp({
     snapshotLeaf(path, coalesceKey) {
       const stacks = this.undoStacks[this.active]
       const now = Date.now()
+      // Journal the first-touch original for this path (before any mutation, before
+      // coalescing can skip us) - the audit that powers O(edits) save diffs
+      const j = this.store[this.active].journal
+      if (j) {
+        const pk = path.join('\u0000')
+        if (!j.paths.has(pk)) j.paths.set(pk, { p: [...path], old: clone(getNode(this.store[this.active].doc, path)) })
+      }
       if (coalesceKey && this.lastSnap.key === this.active + '|' + coalesceKey && now - this.lastSnap.time < 900) {
         this.lastSnap.time = now
         return
@@ -1316,6 +1502,7 @@ createApp({
       for (const [file, refs] of byFile) {
         const fs = this.store[file]
         if (!fs) continue
+        if (fs.journal) fs.journal.structural = true // full snapshot - journal can't follow
         const stacks = this.undoStacks[file]
         if (stacks) {
           stacks.undo.push(JSON.stringify(fs.doc))
@@ -1879,6 +2066,7 @@ createApp({
       for (const [file, list] of byFile) {
         const s = this.store[file]
         if (!s) continue
+        if (s.journal) s.journal.structural = true // splices shift paths
         if (file !== this.active) {
           const stacks = this.undoStacks[file]
           if (stacks) {
@@ -2037,45 +2225,59 @@ createApp({
        even while indexing a multi-MB document */
     ensureSearchIndex() {
       if (this.searchIndex || this._indexBuild) return
-      const build = { cancelled: false, index: [] }
+      const build = { cancelled: false, index: [], capped: false }
       this._indexBuild = build
+      const huge = this.hugeProject
+      const VAL_CAP = huge ? 120 : 200 // cap indexed value text - long strings would
+      // otherwise duplicate the document's bytes into the index
+      const MAX_ENTRIES = 2000000 // hard memory safety valve
       const stack = []
       for (const f of this.files) {
         const s = this.store[f.name]
-        if (s) stack.push({ n: s.doc, p: [], f: f.name })
+        if (s) stack.push({ n: s.doc, t: null, f: f.name })
       }
       const step = () => {
         if (build.cancelled) return
+        // The user is typing: do nothing this beat - their keystrokes come first
+        if (performance.now() - (this._lastTyped || 0) < 200) {
+          setTimeout(step, 120)
+          return
+        }
         const t0 = performance.now()
-        while (stack.length && performance.now() - t0 < 20) {
-          const { n, p, f } = stack.pop()
+        while (stack.length && performance.now() - t0 < 12) {
+          const fr = stack.pop()
+          const n = fr.n
           const t = typeOf(n)
           if (t === 'object') {
-            for (const k of Object.keys(n)) stack.push({ n: n[k], p: [...p, k], f })
+            for (const k of Object.keys(n)) stack.push({ n: n[k], t: { seg: k, up: fr.t }, f: fr.f })
           } else if (t === 'array') {
-            for (let i = 0; i < n.length; i++) stack.push({ n: n[i], p: [...p, i], f })
+            for (let i = 0; i < n.length; i++) stack.push({ n: n[i], t: { seg: i, up: fr.t }, f: fr.f })
           } else {
-            const key = p.length ? String(p[p.length - 1]) : ''
-            const pathLabel = p.map((seg) => (typeof seg === 'number' ? `[${seg}]` : seg)).join(' › ')
+            if (build.index.length >= MAX_ENTRIES) {
+              build.capped = true
+              stack.length = 0
+              break
+            }
+            const seg = fr.t ? fr.t.seg : ''
             const sv = String(n)
-            build.index.push({
-              file: f,
-              path: p,
-              pathLabel,
-              key: key.toLowerCase(),
-              // Cap indexed value text: long strings would otherwise duplicate the whole
-              // document's bytes into the index (search matches within the first 200 chars)
-              val: (sv.length > 200 ? sv.slice(0, 200) : sv).toLowerCase(),
-              pathStr: pathLabel.toLowerCase(),
-              valuePreview: truncate(sv, 80)
-            })
+            const entry = {
+              f: fr.f,
+              t: fr.t, // shared trie node - display path/label derived on demand
+              key: typeof seg === 'string' ? seg.toLowerCase() : String(seg),
+              val: (sv.length > VAL_CAP ? sv.slice(0, VAL_CAP) : sv).toLowerCase(),
+              pv: truncate(sv, 80)
+            }
+            // Path-text matching costs a per-leaf string; affordable below the huge tier
+            if (!huge) entry.ps = trieLabel(fr.t).toLowerCase()
+            build.index.push(entry)
           }
         }
         if (stack.length) {
-          yieldToBrowser(step) // MessageChannel: yields without setTimeout's ~4ms clamp
+          nextSlice(step) // frame-aligned: rendering gets its share of every frame
         } else {
           this._indexBuild = null
           this.searchIndex = build.index
+          if (build.capped) this.toast('Search index capped at 2M values - the deepest content is not searchable', 'error', 8000)
           if (this.searchTerm) this.runSearch(this.searchTerm) // query typed while indexing
         }
       }
@@ -2109,15 +2311,20 @@ createApp({
       let i = 0
       const step = () => {
         if (scan.cancelled) return
+        // The user is typing: hold the scan - results can wait, keystrokes can't
+        if (performance.now() - (this._lastTyped || 0) < 200) {
+          setTimeout(step, 120)
+          return
+        }
         const t0 = performance.now()
-        for (; i < idx.length && performance.now() - t0 < 12; i++) {
+        for (; i < idx.length && performance.now() - t0 < 10; i++) {
           const entry = idx[i]
           let score = 0
           let ok = true
           for (const tok of tokens) {
             if (entry.key.includes(tok)) score += 5
             else if (entry.val.includes(tok)) score += 3
-            else if (entry.pathStr.includes(tok)) score += 2
+            else if (entry.ps && entry.ps.includes(tok)) score += 2
             else {
               ok = false
               break
@@ -2130,7 +2337,7 @@ createApp({
           }
         }
         if (i < idx.length) {
-          yieldToBrowser(step)
+          nextSlice(step) // frame-aligned, same reasoning as the index build
           return
         }
         const out = []
@@ -2143,7 +2350,14 @@ createApp({
         }
         this._searchScan = null
         this.searching = false
-        this.searchResults = out
+        // Display fields (path, label) are derived here for just the shown results -
+        // the index itself stores only shared trie pointers
+        this.searchResults = out.map((e) => ({
+          file: e.f,
+          path: triePath(e.t),
+          pathLabel: trieLabel(e.t),
+          valuePreview: e.pv
+        }))
         this.searchSel = 0
       }
       step()
@@ -2173,8 +2387,55 @@ createApp({
           this.diffPreparing = false // dismissed while preparing
           return
         }
-        this.pendingSaveText = serialize(s.doc)
-        if (s.diskText.length > HUGE_FILE_BYTES) {
+        const huge = s.diskText.length > HUGE_FILE_BYTES
+        this.diffUnits = 'lines'
+        if (huge && s.journal && !s.journal.structural) {
+          // Journal diff: O(edits), no full-document serialize at all. Each edited path
+          // renders as its own hunk (old vs current value, pretty-printed locally).
+          // The write bytes are produced later, behind confirmSave's "Saving…" state.
+          this.pendingSaveText = ''
+          this.pendingWriteText = ''
+          const hunks = []
+          let adds = 0
+          let dels = 0
+          for (const { p, old } of s.journal.paths.values()) {
+            const cur = getNode(s.doc, p)
+            if (JSON.stringify(cur) === JSON.stringify(old)) continue // edited back to original
+            const ops = [{ kind: 'same', text: '@ ' + this.pathLabelOf(p) }]
+            ops.push(
+              ...diffLines(
+                old === undefined ? '' : JSON.stringify(old, null, 2),
+                cur === undefined ? '' : JSON.stringify(cur, null, 2)
+              )
+            )
+            for (const o of ops) {
+              if (o.kind === 'add') adds++
+              else if (o.kind === 'del') dels++
+            }
+            hunks.push(ops)
+          }
+          this.diffAdds = adds
+          this.diffDels = dels
+          this.diffTooBig = adds + dels > 5000
+          this.diffHunks = this.diffTooBig ? [] : hunks
+          this.diffPreparing = false
+          return
+        }
+        if (huge && s.compact) {
+          // Minified huge file: ONE minify pass and a char-scan. The pretty route here
+          // would cost serialize + reparse + reserialize of the whole document (~8+ s
+          // at 150 MB in a single block - Chrome's "page unresponsive" territory)
+          this.pendingWriteText = JSON.stringify(s.doc) + (s.trailNL ? '\n' : '')
+          this.pendingSaveText = this.pendingWriteText // raw pretty text is never needed here
+          const { adds, dels, ops, units } = diffCharsWindowed(s.diskText, this.pendingWriteText)
+          this.diffAdds = adds
+          this.diffDels = dels
+          this.diffTooBig = !!units // widespread change - counts are characters
+          if (units) this.diffUnits = units
+          this.diffHunks = this.diffTooBig ? [] : buildHunks(ops)
+        } else if (huge) {
+          this.pendingSaveText = serialize(s.doc)
+          this.pendingWriteText = this.pendingSaveText
           // Windowed diff: counts + hunk-ready ops without allocating per unchanged line
           const { adds, dels, ops } = diffLinesWindowed(s.diskText, this.pendingSaveText)
           this.diffAdds = adds
@@ -2182,7 +2443,12 @@ createApp({
           this.diffTooBig = adds + dels > 5000
           this.diffHunks = this.diffTooBig ? [] : buildHunks(ops)
         } else {
-          const ops = diffLines(s.diskText, this.pendingSaveText)
+          this.pendingSaveText = serialize(s.doc)
+          // Minified files: write minified, and diff against the pretty baseline so the
+          // modal shows the semantic change rather than a bogus whole-file reformat
+          this.pendingWriteText = s.compact ? JSON.stringify(s.doc) + (s.trailNL ? '\n' : '') : this.pendingSaveText
+          const diffBase = s.compact ? this.prettyBaseOf(s) : s.diskText
+          const ops = diffLines(diffBase, this.pendingSaveText)
           this.diffAdds = ops.filter((o) => o.kind === 'add').length
           this.diffDels = ops.filter((o) => o.kind === 'del').length
           // Rendering an enormous diff (e.g. first-save normalization of a huge file)
@@ -2198,14 +2464,31 @@ createApp({
       this.saving = true
       try {
         const s = this.store[this.active]
-        const outText = s.eol === '\r\n' ? this.pendingSaveText.replace(/\n/g, '\r\n') : this.pendingSaveText
+        if (!this.pendingWriteText && !this.pendingSaveText) {
+          // Journal-diff path deferred the serialize to here - do it behind "Saving…",
+          // after a paint so the button state is visible before the block
+          await new Promise((resolve) => afterPaint(resolve))
+          if (s.compact) {
+            this.pendingWriteText = JSON.stringify(s.doc) + (s.trailNL ? '\n' : '')
+            this.pendingSaveText = this.pendingWriteText
+          } else {
+            this.pendingSaveText = serialize(s.doc)
+            this.pendingWriteText = this.pendingSaveText
+          }
+        }
+        const writeText = this.pendingWriteText || this.pendingSaveText
+        const outText = s.eol === '\r\n' ? writeText.replace(/\n/g, '\r\n') : writeText
         await api('/api/files/' + encodeURIComponent(this.active), {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: outText // raw text - no envelope to double-parse on either end
         })
-        s.diskText = this.pendingSaveText
-        s.prettyBase = this.pendingSaveText
+        s.diskText = writeText // what's on disk (minified for compact files)
+        // Pretty baseline: for huge compact saves pendingSaveText IS the minified text
+        // (the pretty conversion was skipped) - leave it null for lazy recompute instead
+        s.prettyBase = s.compact && writeText.length > HUGE_FILE_BYTES ? null : this.pendingSaveText
+        // The save is the new baseline - start a fresh change journal
+        s.journal = { paths: new Map(), structural: false }
         this.dirtyMap[this.active] = false
         this.diffOpen = false
         this.toast(`Saved ${this.active}`)
@@ -2359,6 +2642,7 @@ createApp({
             const v = node[k]
             if (typeof v === 'string' && mapping.has(v)) {
               if (!touched) {
+                if (s.journal) s.journal.structural = true // full snapshot - journal can't follow
                 const stacks = this.undoStacks[f.name]
                 if (stacks) {
                   stacks.undo.push(JSON.stringify(s.doc))

@@ -106,6 +106,8 @@ above apply and the first ⚙️ save creates `jotson.config.json` in your proje
   debounced off the typing path.
 - Saves are validated (must parse as JSON), shown as a line diff for confirmation first, and
   preserve each file's existing CRLF/LF line endings for minimal version-control noise.
+- Minified (single-line) files stay minified: you edit and diff in pretty-printed form,
+  but saves write the file back as one line, preserving its format.
 - There is deliberately no backup system, the assumption is your data files live in git.
 - String `id` fields are auto-generated as UUIDs when adding/duplicating items.
 - Strings matching `YYYY-MM-DD` / ISO datetimes are treated as `date`/`datetime` types with

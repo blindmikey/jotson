@@ -221,9 +221,7 @@
             <option v-for="t in typeOptions" :key="t" :value="t">{{ t }}</option>
           </select>
           <span v-if="selected.type === 'object' || selected.type === 'array'" class="type-count">
-            {{ selected.type === 'array'
-              ? selected.value.length + (selected.value.length === 1 ? ' item' : ' items')
-              : Object.keys(selected.value).length + (Object.keys(selected.value).length === 1 ? ' key' : ' keys') }}
+            {{ selectedSize }}
           </span>
         </div>
 
@@ -327,9 +325,7 @@
           <template v-else>
             <!-- Root selection has no type row, so the count lives here -->
             <div v-if="!selPath.length" class="container-note">
-              {{ selected.type === 'array'
-                ? selected.value.length + (selected.value.length === 1 ? ' item' : ' items')
-                : Object.keys(selected.value).length + (Object.keys(selected.value).length === 1 ? ' key' : ' keys') }}
+              {{ selectedSize }}
             </div>
           </template>
         </div>
@@ -537,8 +533,8 @@
       <div class="diff-body">
         <div v-if="diffPreparing" class="hint diff-toobig">Preparing diff…</div>
         <div v-if="diffTooBig" class="hint diff-toobig">
-          This diff is too large to display ({{ (diffAdds + diffDels).toLocaleString() }} changed lines - often the
-          one-time pretty-print normalization of a hand-formatted file). Saving writes the complete pretty-printed document.
+          This diff is too large to display ({{ (diffAdds + diffDels).toLocaleString() }} changed {{ diffUnits }} - often the
+          one-time normalization of a differently-formatted file). Saving writes the complete document.
         </div>
         <template v-for="(hunk, hi) in diffHunks" :key="hi">
           <div class="hunk-sep" v-if="hi > 0">⋯</div>
@@ -549,7 +545,7 @@
         <div v-if="!diffHunks.length && !diffTooBig && !diffPreparing" class="search-empty">No changes</div>
       </div>
       <div class="modal-actions">
-        <span class="hint">Files are versioned with git - use git to revert if needed.</span>
+        <span v-if="store[active] && store[active].compact" class="hint">Minified file - saved as a single line.</span>
         <button class="btn ghost" @click="diffOpen = false">Cancel</button>
         <button class="btn save" @click="confirmSave" :disabled="saving || diffPreparing">{{ saving ? 'Saving…' : diffPreparing ? 'Preparing…' : 'Save file' }}</button>
       </div>
