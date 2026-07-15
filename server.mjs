@@ -84,7 +84,7 @@ const PORT = Number(process.env.JOTSON_PORT) || 4400
 const FILE_NAME_RE = /^[A-Za-z0-9_-]+\.json$/
 
 const CONFIG_DEFAULTS = {
-  dataDir: '',
+  jsonDir: '',
   publicDir: '',
   uploadDir: '',
   logo: null,
@@ -101,12 +101,19 @@ const CONFIG_DEFAULTS = {
 const JOTSON_BRAND = '{J𝘰𝓉SON}'
 
 let config = { ...CONFIG_DEFAULTS }
+let rawConfig = {}
 try {
-  config = { ...CONFIG_DEFAULTS, ...JSON.parse(await fs.readFile(CONFIG_PATH, 'utf8')) }
+  rawConfig = JSON.parse(await fs.readFile(CONFIG_PATH, 'utf8'))
+  config = { ...CONFIG_DEFAULTS, ...rawConfig }
 } catch {
   /* no config file - defaults apply */
 }
 delete config.jotsonBrand // legacy key from configs written by <= 1.0.0 - now internal-only
+// Rename (v1.2): dataDir -> jsonDir. Legacy configs keep working untouched; the ⚙ panel
+// writes the new key on its next save. An explicit jsonDir wins ("" = project root is a
+// real value, so presence in the file decides, not truthiness).
+if (!('jsonDir' in rawConfig) && typeof config.dataDir === 'string') config.jsonDir = config.dataDir
+delete config.dataDir
 // Pre-release rename: mediaDir -> uploadDir (migrate silently, drop the old key on next save)
 if (typeof config.mediaDir === 'string' && !config.uploadDir) config.uploadDir = config.mediaDir
 delete config.mediaDir
@@ -117,7 +124,7 @@ if (config.uploadDir && config.publicDir) {
   else if (config.uploadDir.startsWith(config.publicDir + '/')) config.uploadDir = config.uploadDir.slice(config.publicDir.length + 1)
 }
 
-const dataDir = () => path.resolve(ROOT, config.dataDir)
+const jsonDir = () => path.resolve(ROOT, config.jsonDir)
 const sitePublicDir = () => path.resolve(ROOT, config.publicDir)
 // Uploads land here - always inside the public dir so stored paths are site-relative
 // and previews/serving work by construction; empty = the public dir root itself
@@ -197,12 +204,12 @@ function readBodyRaw(req, maxBytes) {
 }
 
 async function listDataFiles() {
-  const entries = await fs.readdir(dataDir())
+  const entries = await fs.readdir(jsonDir())
   const files = []
   // Only list names the read/write endpoints accept (FILE_NAME_RE), and never the
-  // tool's own config, which shows up when dataDir is the project root
+  // tool's own config, which shows up when jsonDir is the project root
   for (const name of entries.filter((n) => FILE_NAME_RE.test(n)).sort()) {
-    const full = path.join(dataDir(), name)
+    const full = path.join(jsonDir(), name)
     if (full === CONFIG_PATH) continue
     const stat = await fs.stat(full)
     files.push({ name, size: stat.size, mtime: stat.mtimeMs })
@@ -298,9 +305,10 @@ async function handleApi(req, res, url) {
         return sendJson(res, 400, { error: 'Request body must be JSON' })
       }
       const next = { ...config }
-      // Empty string is a valid value for all dirs - project root for data/public,
+      // Empty string is a valid value for all dirs - project root for json/public,
       // "same as public dir" for media
-      if (typeof body.dataDir === 'string') next.dataDir = body.dataDir.trim()
+      if (typeof body.jsonDir === 'string') next.jsonDir = body.jsonDir.trim()
+      else if (typeof body.dataDir === 'string') next.jsonDir = body.dataDir.trim() // legacy key
       if (typeof body.publicDir === 'string') next.publicDir = body.publicDir.trim()
       if (typeof body.uploadDir === 'string') next.uploadDir = body.uploadDir.trim()
       next.logo = typeof body.logo === 'string' && body.logo.trim() ? body.logo.trim() : null
@@ -315,8 +323,8 @@ async function handleApi(req, res, url) {
         next.idFields = fields.length ? fields : CONFIG_DEFAULTS.idFields
       }
       if (typeof body.references === 'boolean') next.references = body.references
-      if (!(await isDirectory(path.resolve(ROOT, next.dataDir)))) {
-        return sendJson(res, 400, { error: `Data directory not found: ${next.dataDir}` })
+      if (!(await isDirectory(path.resolve(ROOT, next.jsonDir)))) {
+        return sendJson(res, 400, { error: `JSON directory not found: ${next.jsonDir}` })
       }
       if (!(await isDirectory(path.resolve(ROOT, next.publicDir)))) {
         return sendJson(res, 400, { error: `Public directory not found: ${next.publicDir}` })
@@ -359,7 +367,7 @@ async function handleApi(req, res, url) {
     if (!names.length) return sendJson(res, 200, { orphans: [] })
     let haystack = (Array.isArray(body.referenced) ? body.referenced : []).map(String).join('\n')
     for (const f of await listDataFiles()) {
-      haystack += '\n' + (await fs.readFile(path.join(dataDir(), f.name), 'utf8'))
+      haystack += '\n' + (await fs.readFile(path.join(jsonDir(), f.name), 'utf8'))
     }
     const orphans = []
     for (const name of names) {
@@ -487,7 +495,7 @@ async function handleApi(req, res, url) {
   if (parts[1] === 'files' && parts.length === 3) {
     const name = decodeURIComponent(parts[2])
     if (!validName(name)) return sendJson(res, 400, { error: 'Invalid file name' })
-    const filePath = path.join(dataDir(), name)
+    const filePath = path.join(jsonDir(), name)
 
     if (req.method === 'GET') {
       // Raw text, not a JSON envelope: wrapping a 100 MB file in {"text": ...} would
@@ -593,7 +601,7 @@ server.listen(PORT, '127.0.0.1', () => {
   const { port } = server.address()
   console.log(`\n  ${config.title === '' ? JOTSON_BRAND : JOTSON_BRAND + ' - ' + config.title}`)
   if (port !== PORT) console.log(`  Port ${PORT} is in use - using ${port} instead`)
-  console.log(`  Editing:  ${dataDir()}`)
+  console.log(`  Editing:  ${jsonDir()}`)
   console.log(`  Media:    ${sitePublicDir()}`)
   console.log(`  Config:   ${CONFIG_PATH}`)
   console.log(`\n  ➜  http://localhost:${port}\n`)

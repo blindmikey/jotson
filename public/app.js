@@ -61,6 +61,49 @@ function vimeoEmbed(v) {
   return m ? 'https://player.vimeo.com/video/' + m[1] : null
 }
 
+function loomEmbed(v) {
+  const m = v.match(/loom\.com\/(?:share|embed)\/([a-f0-9]{16,})/i)
+  return m ? 'https://www.loom.com/embed/' + m[1] : null
+}
+
+function wistiaEmbed(v) {
+  // {account}.wistia.com/medias/{id}, fast.wistia.net/embed/iframe/{id}, or ?wvideo={id}
+  const m = v.match(/(?:wistia\.(?:com|net)\/(?:medias|embed\/iframe)\/|[?&]wvideo=)([a-z0-9]{8,12})/i)
+  return m ? 'https://fast.wistia.net/embed/iframe/' + m[1] : null
+}
+
+function dailymotionEmbed(v) {
+  const m = v.match(/(?:dailymotion\.com\/(?:embed\/)?video\/|dai\.ly\/)([a-zA-Z0-9]+)/)
+  return m ? 'https://www.dailymotion.com/embed/video/' + m[1] : null
+}
+
+function cfStreamEmbed(v) {
+  // watch.cloudflarestream.com/{id}, iframe.videodelivery.net/{id}, customer-*.cloudflarestream.com/{id}/...
+  const m = v.match(/(?:watch\.cloudflarestream\.com|iframe\.videodelivery\.net|[a-z0-9-]+\.cloudflarestream\.com)\/([a-f0-9]{16,})/i)
+  return m ? 'https://iframe.videodelivery.net/' + m[1] : null
+}
+
+function bunnyEmbed(v) {
+  // iframe.mediadelivery.net/embed/{libraryId}/{videoGuid} (or /play/)
+  const m = v.match(/iframe\.mediadelivery\.net\/(?:embed|play)\/(\d+)\/([a-f0-9-]{32,36})/i)
+  return m ? 'https://iframe.mediadelivery.net/embed/' + m[1] + '/' + m[2] : null
+}
+
+/* Any supported video platform url → its keyless iframe embed url. Platforms whose
+   embeds need script injection (TikTok, Instagram) or a parent-domain param (Twitch)
+   are deliberately absent - they fall back to the unfurl card. */
+function videoEmbed(v) {
+  return (
+    youtubeEmbed(v) ||
+    vimeoEmbed(v) ||
+    loomEmbed(v) ||
+    wistiaEmbed(v) ||
+    dailymotionEmbed(v) ||
+    cfStreamEmbed(v) ||
+    bunnyEmbed(v)
+  )
+}
+
 const unfurlCache = new Map()
 
 /* Search-index paths are stored as shared trie nodes ({seg, up} chains) instead of one
@@ -543,7 +586,7 @@ createApp({
       unfurl: { url: null, loading: false, data: null },
       unfurlTimer: null,
       inspWidth: Number(localStorage.getItem('cms.inspWidth')) || 360,
-      config: { dataDir: '', publicDir: '', uploadDir: '', logo: null, logoLight: null, title: '', labelFields: 'title, label, name, id' },
+      config: { jsonDir: '', publicDir: '', uploadDir: '', logo: null, logoLight: null, title: '', labelFields: 'title, label, name, id' },
       jotsonBrand: JOTSON_BRAND,
       configPath: 'jotson.config.json',
       version: null,
@@ -556,14 +599,15 @@ createApp({
       // References: id index across all loaded files, rebuilt lazily after edits
       refIndex: null, // { targets: Map<id, [{file,path,label,field}]>, referrers: Map<id, [{file,path}]> }
       refTypeOverride: null, // "file:path" of a string manually switched to the reference type
-      refPicker: { open: false, query: '', collection: null, sel: 0 },
+      refPicker: { open: false, query: '', collection: null, sel: 0, field: null },
+      fieldUnfurlTick: 0, // bumped when a Fields-overview unfurl arrives (cache itself is non-reactive)
       colLimits: {}, // "<file>|<column path>" -> extra rows granted via "show more"
       colStarts: {}, // "<file>|<column path>" -> window start granted via "show earlier"
       pendingWriteText: '', // what confirmSave writes (minified for compact files)
       diffTooBig: false,
       diffPreparing: false,
       diffUnits: 'lines', // 'characters' when a minified huge file diffs char-wise
-      cfgDraft: { dataDir: '', publicDir: '', uploadDir: '', logo: '', logoLight: '', title: '', labelFields: '', idFields: '', references: false },
+      cfgDraft: { jsonDir: '', publicDir: '', uploadDir: '', logo: '', logoLight: '', title: '', labelFields: '', idFields: '', references: false },
       cfgSaving: false,
       labelFields: DEFAULT_LABEL_FIELDS,
       toasts: [],
@@ -775,7 +819,7 @@ createApp({
       const draftFields = (d.labelFields || '').split(',').map((f) => f.trim()).filter(Boolean)
       const draftIdFields = (d.idFields || '').split(',').map((f) => f.trim()).filter(Boolean)
       return (
-        d.dataDir !== c.dataDir ||
+        d.jsonDir !== c.jsonDir ||
         d.publicDir !== c.publicDir ||
         (d.uploadDir || '') !== (c.uploadDir || '') ||
         (d.logo || '') !== (c.logo || '') ||
@@ -828,6 +872,7 @@ createApp({
                   : null
             entries.push({
               key: i,
+              v, // reference, not copy - the glyph is value-aware (embed urls get 🎞️)
               label: valLabel || fl || `[${i}]`,
               type: vt,
               // Primitives show their index in the subtle right-hand slot; objects keep
@@ -848,6 +893,7 @@ createApp({
             if (vt === 'string' && this.isRefString(v, k)) vt = 'reference'
             entries.push({
               key: k,
+              v,
               label: k,
               type: vt,
               preview: vt === 'reference' ? '→ ' + this.refTargetLabel(v) : this.entryPreview(v, vt)
@@ -908,6 +954,15 @@ createApp({
       return typeOf(getNode(this.doc, this.selPath.slice(0, -1))) === 'array'
     },
 
+    /* Selected key's position among its parent object's keys, for the reorder buttons */
+    keyPos() {
+      if (!this.selPath.length || this.parentIsArray) return null
+      const parent = getNode(this.doc, this.selPath.slice(0, -1))
+      if (typeOf(parent) !== 'object') return null
+      const keys = Object.keys(parent)
+      return { i: keys.indexOf(this.selPath[this.selPath.length - 1]), n: keys.length }
+    },
+
     tipIndex() {
       return this.selPath.length ? this.selPath[this.selPath.length - 1] : -1
     },
@@ -924,7 +979,7 @@ createApp({
       if (IMG_RE.test(v)) return { kind: 'image', value: v, url: this.resolveUrl(v) }
       if (VID_RE.test(v)) return { kind: 'video', value: v, url: this.resolveUrl(v) }
       if (COLOR_RE.test(v)) return { kind: 'color', value: v }
-      const embed = youtubeEmbed(v) || vimeoEmbed(v)
+      const embed = videoEmbed(v)
       if (embed) return { kind: 'embed', value: v, url: v, embedUrl: embed, internal: false }
       const dk = dateKind(v)
       if (dk) {
@@ -972,6 +1027,12 @@ createApp({
   watch: {
     preview(p) {
       this.scheduleUnfurl(p)
+    },
+    objFields: {
+      handler() {
+        this.prefetchFieldUnfurls()
+      },
+      immediate: true // the restored boot selection may already be an object
     },
     // Keystrokes land in the input instantly; the scan runs after a short pause on big
     // indexes (and the scan itself is chunked, so it never blocks continued typing)
@@ -1251,7 +1312,9 @@ createApp({
       return `[${seg}]`
     },
 
-    typeGlyph(t) {
+    typeGlyph(t, v) {
+      // Value-aware special case: strings holding a YouTube/Vimeo url read as footage
+      if (t === 'string' && typeof v === 'string' && videoEmbed(v)) return '🎞️'
       return (
         {
           string: '“ ”',
@@ -1557,6 +1620,62 @@ createApp({
       return typeof v === 'string' && IMG_RE.test(v)
     },
 
+    /* Per-field media preview for the Fields overview: the visual kinds the main
+       preview computed handles (image / local video / YouTube-Vimeo embed) */
+    fieldMedia(v) {
+      if (typeof v !== 'string' || !v) return null
+      if (IMG_RE.test(v)) return { kind: 'image', url: this.resolveUrl(v) }
+      if (VID_RE.test(v)) return { kind: 'video', url: this.resolveUrl(v) }
+      const embed = videoEmbed(v)
+      if (embed) return { kind: 'embed', embedUrl: embed }
+      return null
+    },
+
+    /* Per-field link row (badge + anchor), mirroring the main preview's url kind.
+       Embeds keep their link row too (like the main preview); images/videos don't. */
+    fieldLink(v) {
+      if (typeof v !== 'string' || !v) return null
+      const m = this.fieldMedia(v)
+      if (m && m.kind !== 'embed') return null
+      if (/^https?:\/\//.test(v)) return { url: v, internal: false }
+      if (/^\//.test(v)) return { url: v, internal: true }
+      return null
+    },
+
+    /* Unfurl card data for a Fields-overview url (cache read only - fetches are kicked
+       off by the objFields watcher, never during render) */
+    fieldUnfurlData(v) {
+      this.fieldUnfurlTick // reactive dependency on arrivals
+      const d = unfurlCache.get(v)
+      return d && (d.title || d.image) ? d : null
+    },
+
+    /* Prefetch unfurls for the external, non-embed urls of the selected object.
+       Capped per selection to stay polite to external hosts; the link row itself
+       always renders, the card is progressive enhancement. */
+    prefetchFieldUnfurls() {
+      const of = this.objFields
+      if (!of) return
+      this._fieldUnfurlPending ||= new Set()
+      let started = 0
+      for (const f of of.entries) {
+        const link = this.fieldLink(f.v)
+        if (!link || link.internal || this.fieldMedia(f.v)) continue
+        const u = f.v
+        if (unfurlCache.has(u) || this._fieldUnfurlPending.has(u)) continue
+        if (started >= 12) break
+        started++
+        this._fieldUnfurlPending.add(u)
+        api('/api/unfurl?url=' + encodeURIComponent(u))
+          .then((data) => unfurlCache.set(u, data))
+          .catch(() => unfurlCache.set(u, null))
+          .finally(() => {
+            this._fieldUnfurlPending.delete(u)
+            this.fieldUnfurlTick++
+          })
+      }
+    },
+
     /* Per-value twins of the selected-node computeds (colorHex6/dtLocalValue/dtSuffix),
        for the Fields overview where each row has its own value */
     hex6Of(v) {
@@ -1740,15 +1859,19 @@ createApp({
       localStorage.setItem('cms.refsNotice', '1')
     },
 
-    openRefPicker() {
+    /* fieldKey is set when opened from a Fields-overview row (template clicks on the
+       main editor pass the event object - only a string counts as a field target) */
+    openRefPicker(fieldKey) {
       this.getRefIndex()
-      this.refPicker = { open: true, query: '', collection: null, sel: 0 }
+      const field = typeof fieldKey === 'string' ? fieldKey : null
+      this.refPicker = { open: true, query: '', collection: null, sel: 0, field }
       this.$nextTick(() => this.$refs.refPickerInput && this.$refs.refPickerInput.focus())
     },
 
     chooseRef(r) {
       if (!r) return
-      this.setValue(r.id)
+      if (this.refPicker.field) this.setFieldValue(this.refPicker.field, r.id)
+      else this.setValue(r.id)
       this.refPicker.open = false
       this.toast(`Now references "${r.label}"`)
     },
@@ -1947,6 +2070,47 @@ createApp({
     cancelAddKey() {
       this.addingKeyAt = null
       this.addKeyDraft = ''
+    },
+
+    /* In-place key reorder: same rebuild idiom as duplicateKey/renameKey. JS caveat:
+       integer-like keys ("0", "42") always enumerate first in numeric order - those
+       can't be repositioned, and serialize follows enumeration order. */
+    reorderKeys(obj, keys) {
+      const rebuilt = {}
+      for (const k of keys) rebuilt[k] = obj[k]
+      for (const k of keys) delete obj[k]
+      Object.assign(obj, rebuilt)
+    },
+
+    moveKey(dir) {
+      const pos = this.keyPos
+      if (!pos) return
+      const j = pos.i + dir
+      if (pos.i < 0 || j < 0 || j >= pos.n) return
+      const parent = getNode(this.doc, this.selPath.slice(0, -1))
+      const keys = Object.keys(parent)
+      this.snapshot()
+      ;[keys[pos.i], keys[j]] = [keys[j], keys[pos.i]]
+      this.reorderKeys(parent, keys)
+      this.refreshDirty()
+    },
+
+    /* Fields overview: id fields first (in configured priority order), then A-Z */
+    sortKeys() {
+      const obj = getNode(this.doc, this.selPath)
+      if (typeOf(obj) !== 'object') return
+      const keys = Object.keys(obj)
+      const ids = this.idFieldsList.filter((k) => keys.includes(k))
+      const rest = keys.filter((k) => !this.idFieldsList.includes(k)).sort((a, b) => a.localeCompare(b))
+      const next = [...ids, ...rest]
+      if (next.every((k, i) => k === keys[i])) {
+        this.toast('Keys are already in that order')
+        return
+      }
+      this.snapshot()
+      this.reorderKeys(obj, next)
+      this.refreshDirty()
+      this.toast('Keys sorted: id fields first, then A to Z')
     },
 
     moveItem(dir) {
@@ -2602,7 +2766,7 @@ createApp({
     /* ---------- config ---------- */
     setCfgDraft(config) {
       this.cfgDraft = {
-        dataDir: config.dataDir,
+        jsonDir: config.jsonDir,
         publicDir: config.publicDir,
         uploadDir: config.uploadDir || '',
         logo: config.logo || '',
@@ -2632,7 +2796,7 @@ createApp({
 
     async saveConfig() {
       const dirsohanged =
-        this.cfgDraft.dataDir !== this.config.dataDir || this.cfgDraft.publicDir !== this.config.publicDir
+        this.cfgDraft.jsonDir !== this.config.jsonDir || this.cfgDraft.publicDir !== this.config.publicDir
       if (dirsohanged && Object.values(this.dirtyMap).some(Boolean)) {
         if (!window.confirm('Changing directories reloads the app and discards unsaved edits. Continue?')) return
       }

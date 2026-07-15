@@ -1,5 +1,5 @@
 {
-  "dataDir": "data/json",
+  "jsonDir": "data/json",
   "publicDir": "public",
   "uploadDir": "uploads",
   "logo": null,

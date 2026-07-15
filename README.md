@@ -70,7 +70,7 @@ tool's folder also works if no project-root config exists.
 
 ```json
 {
-  "dataDir": "data/json",
+  "jsonDir": "data/json",
   "publicDir": "public",
   "uploadDir": "media",
   "logo": "/assets/images/logo.svg",
@@ -84,7 +84,7 @@ tool's folder also works if no project-root config exists.
 
 | Key | Meaning | Default |
 | --- | --- | --- |
-| `dataDir` | Directory of editable `.json` files, relative to the project root | `assets/data/json` |
+| `jsonDir` | Directory of editable `.json` files, relative to the project root | empty (= project root) |
 | `publicDir` | Static media root; served at `/site/*` so `/…` asset paths preview | `public` |
 | `uploadDir` | Where file uploads are stored, relative to `publicDir` (created on first upload). Changing it offers to move existing uploads along and update every path referencing them | empty (= the `publicDir` root) |
 | `logo` | Optional image path (relative to `publicDir`) shown as the header brand | `null` (shows `title`) |
@@ -127,7 +127,8 @@ above apply and the first ⚙️ save creates `jotson.config.json` in your proje
   them as jump links, and browser back/forward retraces jumps and file switches. Renaming
   an id offers to update every reference to follow; deleting a referenced object warns and
   offers to clean the references up (array entries removed, key values blanked).
-- YouTube/Vimeo URLs preview as playable embeds; other external links show an OpenGraph
+- YouTube, Vimeo, Loom, Wistia, Dailymotion, Cloudflare Stream, and Bunny Stream URLs
+  preview as playable embeds (direct `.mp4`/`.webm` links play natively); other external links show an OpenGraph
   preview card (title/description/image), fetched server-side and cached in memory.
 - Light/dark theme toggle in the top bar (persisted per browser).
 - Update notice: on load, the current version is compared against npm (one registry request

@@ -59,19 +59,20 @@
     </div>
   </header>
 
-  <!-- One-time notice (this release): references exist but default off -->
+  <!-- One-time notice (this release): references exist but default off
   <div v-if="showRefsNotice" class="notice-bar">
     <span>
       🔗 <strong>New: references.</strong> Strings matching an object's id can resolve across files - off by default.
-      If your ids are globally unique, enable it in <button class="notice-link" @click="settingsOpen = true">⚙ settings</button>.
+      If your ids are globally unique, enable it in <button class="notice-link" @click="settingsOpen = true">⚙️ settings</button>.
     </span>
     <button class="notice-x" @click="dismissRefsNotice" title="Dismiss">✕</button>
   </div>
+  -->
 
   <!-- ===== Settings popover ===== -->
   <div v-if="settingsOpen" class="settings-pop">
-    <label>Data directory <span class="hint">(JSON files, relative to project root; empty = project root)</span></label>
-    <input v-model="cfgDraft.dataDir" spellcheck="false" placeholder="data/json" />
+    <label>JSON directory <span class="hint">(the .json files to edit, relative to project root; empty = project root)</span></label>
+    <input v-model="cfgDraft.jsonDir" spellcheck="false" placeholder="data/json" />
     <label>Public directory <span class="hint">(media root for previews; empty = project root)</span></label>
     <input v-model="cfgDraft.publicDir" spellcheck="false" placeholder="public" />
     <label>Upload directory <span class="hint">(inside the public directory; empty = its root)</span></label>
@@ -157,7 +158,7 @@
               @click="selectCell(ci, entry.key)"
               @contextmenu.prevent="openCtxMenu($event, ci, entry.key)"
             >
-              <span class="cell-type" :class="'t-' + entry.type">{{ typeGlyph(entry.type) }}</span>
+              <span class="cell-type" :class="'t-' + entry.type">{{ typeGlyph(entry.type, entry.v) }}</span>
               <span class="cell-key">{{ entry.label }}</span>
               <span class="cell-preview">{{ entry.preview }}</span>
               <span v-if="entry.type === 'object' || entry.type === 'array'" class="cell-arrow">›</span>
@@ -238,6 +239,9 @@
 
           <template v-else>
             <div class="op-group">
+              <button class="btn op" @click="moveKey(-1)" :disabled="!keyPos || keyPos.i <= 0" title="Move key up">↑</button>
+              <button class="btn op" @click="moveKey(1)" :disabled="!keyPos || keyPos.i === keyPos.n - 1" title="Move key down">↓</button>
+              <button class="btn op" @click="duplicateKey">⧉ Duplicate</button>
               <button class="btn op danger" @click="deleteNode">✕ Delete key</button>
             </div>
           </template>
@@ -389,12 +393,15 @@
         <!-- Object fields: every key editable inline with previews, hr-delimited (capped for huge objects) -->
         <div v-if="objFields" class="obj-fields">
           <hr class="of-rule" />
-          <div class="sp-title">Fields</div>
+          <div class="sp-title of-title">
+            Fields
+            <button class="btn tiny ghost" @click="sortKeys" title="Reorder this object's keys: id fields first, then alphabetical">⇅ sort</button>
+          </div>
           <template v-for="(f, fi) in objFields.entries" :key="f.k">
             <hr v-if="fi > 0" class="of-rule" />
             <div class="obj-field">
               <button class="of-key" @click="selPath = [...selPath, f.k]" :title="'Open ' + f.k">
-                <span class="cell-type" :class="'t-' + fieldType(f.v, f.k)">{{ typeGlyph(fieldType(f.v, f.k)) }}</span>
+                <span class="cell-type" :class="'t-' + fieldType(f.v, f.k)">{{ typeGlyph(fieldType(f.v, f.k), f.v) }}</span>
                 <span class="of-name">{{ f.k }}</span>
               </button>
               <div class="of-value">
@@ -419,11 +426,36 @@
                   <button :class="{ on: f.v === false }" @click="setFieldValue(f.k, false)">false</button>
                 </div>
                 <span v-else-if="fieldType(f.v, f.k) === 'null'" class="null-note">null</span>
-                <button v-else-if="fieldType(f.v, f.k) === 'reference'" class="of-container" @click="selPath = [...selPath, f.k]">→ {{ refTargetLabel(f.v) }}</button>
+                <div v-else-if="fieldType(f.v, f.k) === 'reference'" class="of-typed of-ref">
+                  <button class="of-container" @click="selPath = [...selPath, f.k]">→ {{ refTargetLabel(f.v) }}</button>
+                  <button class="btn op" @click="openRefPicker(f.k)" title="Pick a different target for this reference">🔗</button>
+                </div>
                 <button v-else class="of-container" @click="selPath = [...selPath, f.k]">{{ entryPreview(f.v, fieldType(f.v, f.k)) }} ›</button>
               </div>
-              <div v-if="fieldType(f.v, f.k) === 'file' && isImgPath(f.v)" class="smart-preview">
-                <img :src="resolveUrl(f.v)" alt="" />
+              <div v-if="fieldLink(f.v)" class="sp-url of-link">
+                <span class="badge" :class="fieldLink(f.v).internal ? 'internal' : 'external'">{{ fieldLink(f.v).internal ? 'internal' : 'external' }}</span>
+                <a :href="fieldLink(f.v).url" target="_blank" rel="noopener">{{ f.v }}</a>
+              </div>
+              <a v-if="fieldUnfurlData(f.v)" class="unfurl-card" :href="f.v" target="_blank" rel="noopener">
+                <img v-if="fieldUnfurlData(f.v).image" :src="fieldUnfurlData(f.v).image" alt="" loading="lazy" />
+                <div class="unfurl-text">
+                  <div v-if="fieldUnfurlData(f.v).siteName" class="unfurl-site">{{ fieldUnfurlData(f.v).siteName }}</div>
+                  <div v-if="fieldUnfurlData(f.v).title" class="unfurl-title">{{ fieldUnfurlData(f.v).title }}</div>
+                  <div v-if="fieldUnfurlData(f.v).description" class="unfurl-desc">{{ fieldUnfurlData(f.v).description }}</div>
+                </div>
+              </a>
+              <div v-if="fieldMedia(f.v)" class="smart-preview">
+                <img v-if="fieldMedia(f.v).kind === 'image'" :src="fieldMedia(f.v).url" alt="" loading="lazy" />
+                <video v-else-if="fieldMedia(f.v).kind === 'video'" :src="fieldMedia(f.v).url" controls muted playsinline preload="metadata"></video>
+                <iframe
+                  v-else-if="fieldMedia(f.v).kind === 'embed'"
+                  class="sp-embed"
+                  :src="fieldMedia(f.v).embedUrl"
+                  loading="lazy"
+                  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                  allowfullscreen
+                  referrerpolicy="strict-origin-when-cross-origin"
+                ></iframe>
               </div>
             </div>
           </template>
