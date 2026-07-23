@@ -179,6 +179,27 @@ code { font-family: var(--mono); font-size: 0.85em; }
 .settings-pop .cfg-check-hint { margin-top: -0.35rem; }
 .settings-credit { border-top: 1px solid var(--border); padding-top: 0.6rem; margin-top: 0.2rem; text-align: center; }
 
+.enum-select { width: 100%; font-family: var(--mono); }
+/* Re-derive button - sits just right of the gear scope in schema mode */
+.schema-refresh { margin-left: 0.25rem; font-size: 1rem; }
+
+/* Schema gear: neutral when no schema, green when one exists; the active state draws a
+   border around gear + schema file name so they read as one scoped unit */
+.gear-scope { display: inline-flex; align-items: center; flex-shrink: 0; border: 1px solid transparent; border-radius: 6px; }
+.gear-scope.active { border-color: var(--text-faint); }
+.gear-scope.active.has { border-color: var(--green); }
+.gear-btn {
+  padding: 0.15rem 0.4rem;
+  font-size: 0.9rem;
+  line-height: 1;
+  color: var(--text-faint);
+  border-radius: 5px;
+}
+.gear-btn:hover { background: var(--bg-hover); color: var(--text); }
+.gear-scope.has .gear-btn { color: var(--green); }
+.gear-scope.active .crumb.root { color: var(--text-faint); }
+.gear-scope.active.has .crumb.root { color: var(--green); }
+
 .kbd-hints {
   margin-left: auto;
   padding-left: 1rem;
@@ -188,6 +209,7 @@ code { font-family: var(--mono); font-size: 0.85em; }
   flex-shrink: 0;
 }
 .kbd-hints kbd { font-size: 0.62rem; padding: 0 0.25rem; }
+/* When the sidecar action chips are present they carry the push-right; the hints follow */
 @media (max-width: 960px) {
   .kbd-hints { display: none; } /* the pathbar's crumbs win when space is tight */
 }
@@ -540,9 +562,42 @@ body.resizing .columns { scroll-behavior: auto; }
 .badge { font-size: 0.64rem; padding: 0.1rem 0.4rem; border-radius: 999px; flex-shrink: 0; text-transform: uppercase; letter-spacing: 0.04em; }
 .badge.internal { background: rgba(109, 120, 242, 0.18); color: var(--indigo); }
 .badge.external { background: rgba(224, 168, 60, 0.18); color: var(--amber); }
-.sp-multiline { white-space: pre-line; font-size: 0.82rem; color: var(--text-dim); line-height: 1.55; max-height: 220px; overflow-y: auto; }
+/* Single breaks stay tight (pre-line inside each paragraph); blank lines become
+   paragraph gaps, so one break vs two reads unmistakably different */
+.sp-multiline { font-size: 0.82rem; color: var(--text-dim); max-height: 28vh; overflow-y: auto; }
+.sp-multiline p { white-space: pre-line; line-height: 1.35; margin: 0 0 1.8em; }
+.sp-multiline p:last-child { margin-bottom: 0; }
+/* Rendered markdown preview - compact scale to fit the side panel */
+/* Tight lines within a paragraph, generous gaps between them - a single line break
+   (rendered as <br>) must read clearly differently from a paragraph break */
+.sp-markdown { font-size: 0.82rem; color: var(--text-dim); line-height: 1.4; max-height: 28vh; overflow-y: auto; }
+.sp-markdown h1, .sp-markdown h2, .sp-markdown h3, .sp-markdown h4, .sp-markdown h5, .sp-markdown h6 {
+  color: var(--text); margin: 0.6em 0 0.25em; line-height: 1.3;
+}
+.sp-markdown h1 { font-size: 1.05rem; }
+.sp-markdown h2 { font-size: 0.98rem; }
+.sp-markdown h3 { font-size: 0.9rem; }
+.sp-markdown h4, .sp-markdown h5, .sp-markdown h6 { font-size: 0.84rem; }
+.sp-markdown p { margin: 0 0 1.5em; }
+.sp-markdown ul, .sp-markdown ol { margin: 0.35em 0; padding-left: 1.3em; }
+.sp-markdown li { margin: 0.15em 0; }
+.sp-markdown code { background: var(--bg-raised); border-radius: 4px; padding: 0.05em 0.3em; font-family: var(--mono); font-size: 0.9em; }
+.sp-markdown pre { background: var(--bg-raised); border-radius: 6px; padding: 0.5em 0.7em; overflow-x: auto; margin: 0.4em 0; }
+.sp-markdown pre code { background: none; padding: 0; }
+.sp-markdown blockquote { border-left: 3px solid var(--border); margin: 0.4em 0; padding: 0.1em 0 0.1em 0.7em; color: var(--text-faint); }
+.sp-markdown a { color: var(--cyan); }
+.sp-markdown hr { border: none; border-top: 1px solid var(--border); margin: 0.6em 0; }
+.sp-markdown :first-child { margin-top: 0; }
+.sp-markdown :last-child { margin-bottom: 0; }
 
 .sp-embed { width: 100%; aspect-ratio: 16 / 9; border: none; border-radius: 6px; background: #000; }
+.img-meta { margin-top: 0.35rem; font-size: 0.68rem; color: var(--text-faint); font-family: var(--mono); }
+.schema-ask { max-width: 460px; }
+.schema-ask-body { padding: 0.9rem 1.1rem; font-size: 0.84rem; color: var(--text-dim); line-height: 1.5; }
+/* In-app confirm: layers above other modals (settings, ref picker, etc.) */
+.confirm-scrim { z-index: 100; }
+.confirm-modal { max-width: 420px; }
+.confirm-body { padding: 1.1rem 1.2rem; font-size: 0.9rem; line-height: 1.5; white-space: pre-line; }
 
 .unfurl-card {
   display: flex;
@@ -571,6 +626,7 @@ body.resizing .columns { scroll-behavior: auto; }
 
 .insp-ops { display: flex; flex-direction: column; gap: 0.6rem; border-top: 1px solid var(--border); padding-top: 0.9rem; }
 .op-group { display: flex; gap: 0.4rem; flex-wrap: wrap; align-items: center; }
+.img-fill-row { margin-top: 0.5rem; }
 .keyname-input { flex: 1; min-width: 0; font-family: var(--mono); font-size: 0.85rem; font-weight: 600; padding: 0.25rem 0.5rem; }
 .edit-key { opacity: 0; transition: opacity 0.15s; }
 .insp-head:hover .edit-key { opacity: 1; }
@@ -722,17 +778,25 @@ body.resizing .columns { scroll-behavior: auto; }
   padding: 0.3rem;
   display: flex;
   flex-direction: column;
+  gap: 0.1rem; /* breathing room between rows */
 }
 .ctx-item {
   text-align: left;
-  padding: 0.42rem 0.6rem;
+  padding: 0.38rem 0.6rem;
   border-radius: 6px;
   font-size: 0.82rem;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+  flex-shrink: 0; /* a scrolling menu (max-height) must not compress rows and clip text */
 }
-.ctx-item:hover { background: var(--bg-hover); }
+/* --bg-hover matches --bg-float in dark, so it reads as no change on a floating menu -
+   accent-soft tints visibly in both themes */
+.ctx-item:hover { background: var(--accent-soft); }
+/* "+ Add key" schema keyword suggestions - reuses ctx-menu; hi = keyboard highlight */
+.addkey-menu { max-height: 260px; overflow-y: auto; }
+.addkey-menu .ctx-item { font-family: var(--mono); }
+.addkey-menu .ctx-item.hi { background: var(--accent-soft); color: var(--text); }
 .ctx-item.danger { color: #ff7285; }
 .ctx-item.danger:hover { background: var(--accent-soft); }
 body.light .ctx-item.danger { color: #c22839; }
@@ -748,7 +812,6 @@ body.light .ctx-item.danger { color: #c22839; }
   text-overflow: ellipsis;
 }
 .ctx-list { max-height: 240px; overflow-y: auto; display: flex; flex-direction: column; }
-.ctx-list .ctx-item { flex-shrink: 0; }
 
 /* ===== Toasts ===== */
 .toasts { position: fixed; bottom: 1.2rem; left: 50%; transform: translateX(-50%); z-index: 90; display: flex; flex-direction: column; gap: 0.5rem; align-items: center; }

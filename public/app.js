@@ -232,6 +232,117 @@ function serialize(doc) {
   return JSON.stringify(doc, null, 2) + '\n'
 }
 
+/* ---------- markdown preview (multi-line strings only) ---------- */
+
+/* Cheap signal that a multi-line string is markdown, not just prose with newlines */
+function looksMarkdown(v) {
+  return (
+    /^#{1,6}\s\S/m.test(v) || // heading
+    /^\s*[-*]\s+\S/m.test(v) || // list item
+    /^\s*\d+\.\s+\S/m.test(v) || // ordered list item
+    /^>\s?\S/m.test(v) || // blockquote
+    /^```/m.test(v) || // code fence
+    /\*\*[^*\n]+\*\*/.test(v) || // bold
+    /`[^`\n]+`/.test(v) || // inline code
+    /\[[^\]\n]+\]\((https?:\/\/|\/)[^)\s]*\)/.test(v) // link
+  )
+}
+
+function mdEscape(s) {
+  // Quotes are escaped too - hrefs built later must not be breakable out of
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+}
+
+/* Inline spans on an ALREADY-ESCAPED line: code, bold, italic, links (http(s) or
+   site-relative only). Underscore emphasis is skipped - snake_case is too common in data. */
+function mdInline(s) {
+  s = s.replace(/`([^`]+)`/g, '<code>$1</code>')
+  s = s.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  s = s.replace(/\*([^*\s][^*]*)\*/g, '<em>$1</em>')
+  s = s.replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+|\/[^)\s]*)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
+  return s
+}
+
+/* Minimal, dependency-free block renderer. Input is escaped before any tags are added,
+   so the output is safe for v-html. Supports the everyday subset: headings, lists
+   (ul/ol), blockquotes, fenced code, hr, paragraphs with hard line breaks. */
+function renderMarkdown(src) {
+  const lines = mdEscape(src).split('\n')
+  const out = []
+  let para = [] // pending paragraph lines
+  let list = null // 'ul' | 'ol'
+  let quote = false
+  let fence = false
+
+  const flushPara = () => {
+    if (para.length) out.push('<p>' + para.map(mdInline).join('<br>') + '</p>')
+    para = []
+  }
+  const closeList = () => {
+    if (list) out.push('</' + list + '>')
+    list = null
+  }
+  const closeQuote = () => {
+    if (quote) out.push('</blockquote>')
+    quote = false
+  }
+
+  for (const line of lines) {
+    if (fence) {
+      if (/^```/.test(line)) {
+        out.push('</code></pre>')
+        fence = false
+      } else {
+        out.push(line)
+      }
+      continue
+    }
+    if (/^```/.test(line)) {
+      flushPara(); closeList(); closeQuote()
+      out.push('<pre><code>')
+      fence = true
+      continue
+    }
+    const h = line.match(/^(#{1,6})\s+(.+)$/)
+    if (h) {
+      flushPara(); closeList(); closeQuote()
+      const n = h[1].length
+      out.push(`<h${n}>` + mdInline(h[2]) + `</h${n}>`)
+      continue
+    }
+    if (/^\s*(-{3,}|\*{3,})\s*$/.test(line)) {
+      flushPara(); closeList(); closeQuote()
+      out.push('<hr>')
+      continue
+    }
+    const q = line.match(/^&gt;\s?(.*)$/) // ">" was already escaped to &gt;
+    if (q) {
+      flushPara(); closeList()
+      if (!quote) { out.push('<blockquote>'); quote = true }
+      out.push('<p>' + mdInline(q[1]) + '</p>')
+      continue
+    }
+    const ul = line.match(/^\s*[-*]\s+(.+)$/)
+    const ol = line.match(/^\s*\d+\.\s+(.+)$/)
+    if (ul || ol) {
+      flushPara(); closeQuote()
+      const kind = ul ? 'ul' : 'ol'
+      if (list !== kind) { closeList(); out.push('<' + kind + '>'); list = kind }
+      out.push('<li>' + mdInline((ul || ol)[1]) + '</li>')
+      continue
+    }
+    if (!line.trim()) {
+      flushPara(); closeList(); closeQuote()
+      continue
+    }
+    closeList(); closeQuote()
+    para.push(line)
+  }
+  flushPara(); closeList(); closeQuote()
+  if (fence) out.push('</code></pre>')
+  return out.join('\n')
+}
+
 /* Number of lines a value occupies in 2-space pretty-printed JSON. */
 function lineCount(v) {
   const t = typeOf(v)
@@ -539,6 +650,100 @@ async function api(path, opts) {
   return data
 }
 
+/* ---------- schema derivation (the pathbar's "derive schema" button) ---------- */
+
+const UUID_VAL_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+// JSON Schema's own `type` values - offered as a dropdown when editing a schema sidecar,
+// so a "type" field isn't free text (draft-07's primitive type set)
+const SCHEMA_TYPE_VALUES = ['string', 'number', 'integer', 'boolean', 'object', 'array', 'null']
+
+// Keys whose CHILDREN are user-defined names (field/definition names), not schema
+// keywords - "+ Add key" inside these stays free text with no keyword suggestions.
+const SCHEMA_NAME_CONTAINERS = new Set(['properties', '$defs', 'definitions', 'patternProperties', 'dependentSchemas'])
+
+// Suggested keywords for "+ Add key" on a schema node, each with a sensible starter value
+// (so adding `properties` makes `{}`, `required` makes `[]`, `type` makes an editable
+// dropdown, etc.). Scoped by the node's declared `type`; keys already present are dropped.
+const SCHEMA_KEYWORDS = {
+  common: { type: 'string', title: '', description: '', default: '', enum: [], const: '', $ref: '', $comment: '' },
+  object: { properties: {}, required: [], additionalProperties: true, minProperties: 0, maxProperties: 0, patternProperties: {} },
+  array: { items: {}, minItems: 0, maxItems: 0, uniqueItems: false },
+  string: { format: '', minLength: 0, maxLength: 0, pattern: '' },
+  number: { minimum: 0, maximum: 0, exclusiveMinimum: 0, exclusiveMaximum: 0, multipleOf: 1 },
+  integer: { minimum: 0, maximum: 0, exclusiveMinimum: 0, exclusiveMaximum: 0, multipleOf: 1 },
+  root: { $schema: 'http://json-schema.org/draft-07/schema#', $id: '', $defs: {} }
+}
+
+/* Conservative enum inference: a small set of short, repeating, plain strings.
+   Ids, uuids, dates, colors, urls, paths, and multiline text never become enums -
+   a wrong enum is worse than no enum (it turns a free field into a dropdown). */
+function looksCategorical(vals, key, idFields) {
+  if (idFields.includes(key)) return false
+  if (vals.length < 4 || !vals.every((v) => typeof v === 'string')) return false
+  const distinct = new Set(vals)
+  if (distinct.size > 10 || distinct.size / vals.length > 0.5) return false
+  for (const v of distinct) {
+    if (!v || v.length > 40 || v.includes('\n')) return false
+    if (/^https?:\/\//.test(v) || FILE_RE.test(v) || COLOR_RE.test(v)) return false
+    if (DATE_ONLY_RE.test(v) || DATETIME_RE.test(v) || UUID_VAL_RE.test(v)) return false
+  }
+  return true
+}
+
+/* Schema for one property, derived from its values across all sibling objects */
+function deriveValues(vals, key, idFields) {
+  const types = new Set(vals.map(typeOf))
+  if (types.has('null')) return {} // nullable - leave unconstrained rather than wrong
+  if (types.size !== 1) return {} // mixed types - unconstrained
+  const t = [...types][0]
+  if (t === 'string') {
+    if (looksCategorical(vals, key, idFields)) {
+      return { type: 'string', enum: [...new Set(vals)].sort((a, b) => a.localeCompare(b)) }
+    }
+    if (vals.every((v) => DATE_ONLY_RE.test(v))) return { type: 'string', format: 'date' }
+    if (vals.every((v) => DATETIME_RE.test(v))) return { type: 'string', format: 'date-time' }
+    return { type: 'string' }
+  }
+  if (t === 'number') return { type: vals.every(Number.isInteger) ? 'integer' : 'number' }
+  if (t === 'boolean') return { type: 'boolean' }
+  if (t === 'array') {
+    const items = vals.flat()
+    return items.length ? { type: 'array', items: deriveValues(items, key, idFields) } : { type: 'array' }
+  }
+  return deriveObjects(vals, idFields)
+}
+
+/* Merge a set of same-shaped objects: properties from every key seen anywhere,
+   required = keys present in every sample */
+function deriveObjects(samples, idFields) {
+  const byKey = new Map()
+  for (const o of samples) {
+    for (const k of Object.keys(o)) {
+      if (!byKey.has(k)) byKey.set(k, [])
+      byKey.get(k).push(o[k])
+    }
+  }
+  const properties = {}
+  const required = []
+  for (const [k, vals] of byKey) {
+    properties[k] = deriveValues(vals, k, idFields)
+    if (vals.length === samples.length) required.push(k)
+  }
+  const out = { type: 'object', properties }
+  if (required.length) out.required = required
+  return out
+}
+
+function deriveRootSchema(doc, idFields) {
+  if (Array.isArray(doc)) {
+    const objs = doc.filter((v) => typeOf(v) === 'object')
+    if (objs.length && objs.length === doc.length) return { type: 'array', items: deriveObjects(objs, idFields) }
+    return doc.length ? { type: 'array', items: deriveValues(doc, '', idFields) } : { type: 'array' }
+  }
+  if (typeOf(doc) === 'object') return deriveObjects([doc], idFields)
+  return deriveValues([doc], '', idFields)
+}
+
 createApp({
   data() {
     return {
@@ -561,6 +766,8 @@ createApp({
       editingKey: false,
       addingKeyAt: null,
       addKeyDraft: '',
+      addKeyHi: -1, // highlighted suggestion index (-1 = commit the typed text)
+      addKeyMenu: { x: 0, y: 0, w: 0, drop: 'down' },
       ctxMenu: { open: false, mode: 'main', x: 0, y: 0 },
       // raw view
       rawText: '',
@@ -594,12 +801,16 @@ createApp({
       refsNoticeDismissed: localStorage.getItem('cms.refsNotice') === '1',
       uploading: false,
       fileTypeOverride: null, // "file:path" of a string manually switched to the file type
+      stringTypeOverride: null, // "file:path" of a detected-type value manually switched to plain string (cleared on selection change)
+      schemaAsk: false, // "create a schema?" modal for the gear button on schema-less files
+      imgMeta: {}, // preview image url -> { w, h, bytes } (filled on img load)
       ofUploadKey: null, // Fields-overview key an upload was requested for (shared hidden input)
       mediaScan: null, // { loading, orphans: [{name,size,mtime}] } - unused-uploads scan state
       // References: id index across all loaded files, rebuilt lazily after edits
       refIndex: null, // { targets: Map<id, [{file,path,label,field}]>, referrers: Map<id, [{file,path}]> }
       refTypeOverride: null, // "file:path" of a string manually switched to the reference type
       refPicker: { open: false, query: '', collection: null, sel: 0, field: null },
+      confirmModal: { open: false, message: '', danger: true, confirmLabel: 'Confirm', _resolve: null },
       fieldUnfurlTick: 0, // bumped when a Fields-overview unfurl arrives (cache itself is non-reactive)
       colLimits: {}, // "<file>|<column path>" -> extra rows granted via "show more"
       colStarts: {}, // "<file>|<column path>" -> window start granted via "show earlier"
@@ -922,6 +1133,11 @@ createApp({
       if (this.doc === undefined) return null
       const v = getNode(this.doc, this.selPath)
       if (v === undefined) return null
+      // Manual "make this a plain string" conversion: skip all value-based detection
+      // (color/date/file/reference) until the selection moves elsewhere
+      if (typeof v === 'string' && this.stringTypeOverride === this.active + ':' + this.selPath.join('/')) {
+        return { value: v, type: 'string' }
+      }
       let type = displayType(v)
       // A string converted to "file" via the dropdown keeps the upload editor for this
       // session even before its value matches FILE_RE (e.g. an empty string pre-upload)
@@ -954,6 +1170,71 @@ createApp({
       return typeOf(getNode(this.doc, this.selPath.slice(0, -1))) === 'array'
     },
 
+    fileSchema() {
+      const s = this.store[this.active]
+      return s ? s.schema : null
+    },
+
+    schemaFileName() {
+      return this.active.replace(/\.json$/, '.schema.json')
+    },
+
+    /* Dropdown options for the selected node - only plain strings get the enum editor
+       (detected types like date/color/file keep their richer editors) */
+    /* Keyword suggestions for the currently-open "+ Add key" input (schema files only) */
+    addKeySuggestions() {
+      if (this.addingKeyAt === null) return null
+      const defaults = this.schemaKeyDefaults(this.selPath.slice(0, this.addingKeyAt))
+      return defaults ? Object.keys(defaults) : null
+    },
+
+    /* Suggestions narrowed to what's typed (substring); empty draft shows them all */
+    filteredAddKeys() {
+      if (!this.addKeySuggestions) return null
+      const q = this.addKeyDraft.trim().toLowerCase()
+      return q ? this.addKeySuggestions.filter((k) => k.toLowerCase().includes(q)) : this.addKeySuggestions
+    },
+
+    schemaEnum() {
+      if (!this.selected || this.selected.type !== 'string') return null
+      return this.enumAt(this.selPath)
+    },
+
+    /* When the selected node is an image file field and its parent object has sibling
+       keys named width/height/size (any case), offer to fill them from the loaded image.
+       Depends on imgMeta, which onImgLoad populates once the preview <img> loads. */
+    imageMetaTargets() {
+      if (!this.selected || this.selected.type !== 'file' || !this.isImgPath(this.selected.value)) return null
+      if (this.selPath.length < 1) return null
+      const parent = getNode(this.doc, this.selPath.slice(0, -1))
+      if (typeOf(parent) !== 'object') return null
+      const meta = this.imgMeta[this.resolveUrl(this.selected.value)]
+      if (!meta || !meta.w) return null
+      const keyOf = (name) => Object.keys(parent).find((k) => k.toLowerCase() === name)
+      const targets = []
+      const wk = keyOf('width'); const hk = keyOf('height'); const sk = keyOf('size')
+      if (wk) targets.push({ key: wk, kind: 'width', value: meta.w })
+      if (hk) targets.push({ key: hk, kind: 'height', value: meta.h })
+      if (sk && meta.bytes != null) targets.push({ key: sk, kind: 'size', value: meta.bytes })
+      return targets.length ? targets : null
+    },
+
+    activeIsSidecar() {
+      const s = this.store[this.active]
+      return !!(s && s.sidecar)
+    },
+
+    /* Does a schema exist (on disk / loaded) for the file the gear refers to? Drives the
+       gear's green vs neutral state in both views. A brand-new unsaved sidecar is
+       neutral until its first save. */
+    schemaPresent() {
+      if (this.activeIsSidecar) {
+        const dataName = this.store[this.active].sidecar
+        return !!(this.store[dataName] && this.store[dataName].schema)
+      }
+      return !!this.fileSchema
+    },
+
     /* Selected key's position among its parent object's keys, for the reorder buttons */
     keyPos() {
       if (!this.selPath.length || this.parentIsArray) return null
@@ -974,6 +1255,8 @@ createApp({
 
     preview() {
       if (!this.selected || typeOf(this.selected.value) !== 'string') return null
+      // Manually converted to plain string: simple input, no smart preview
+      if (this.selected.type === 'string' && this.stringTypeOverride === this.active + ':' + this.selPath.join('/')) return null
       const v = this.selected.value
       if (!v) return null
       if (IMG_RE.test(v)) return { kind: 'image', value: v, url: this.resolveUrl(v) }
@@ -1052,16 +1335,6 @@ createApp({
     searchTerm(q) {
       this.runSearch(q)
     },
-    selPath() {
-      this.syncRename()
-      this.editingKey = false
-      this.persistNav()
-      this.$nextTick(() => {
-        this.resizeStrEditor()
-        const el = this.$refs.columnsEl
-        if (el) el.scrollLeft = el.scrollWidth
-      })
-    },
     selected() {
       this.$nextTick(() => this.resizeStrEditor())
     },
@@ -1077,11 +1350,20 @@ createApp({
       }
     },
 
-    // Keep the current history entry's state at the live position so back/forward
-    // (which only jumps/file-switches push) always returns to where you really were
+    // The ONE selPath watcher (a second `selPath` key here would silently shadow this
+    // one - duplicate object keys - which is exactly the bug this comment guards against).
+    // Keeps the current history entry's state at the live position so back/forward
+    // (which only jumps/file-switches push) always returns to where you really were.
     selPath: {
       deep: true,
       handler() {
+        this.syncRename()
+        this.editingKey = false
+        // A manual "treat as plain string" conversion lasts only while that node stays
+        // selected - moving away re-enables normal value-based type detection
+        if (this.stringTypeOverride && this.stringTypeOverride !== this.active + ':' + this.selPath.join('/')) {
+          this.stringTypeOverride = null
+        }
         if (!this._navRestoring && history.state) history.replaceState(this.navState(), '')
         // Persist EVERY selection change (debounced) - arrow keys, breadcrumbs, and
         // sibling switches assign selPath directly and never pass through persistNav
@@ -1111,6 +1393,7 @@ createApp({
     // click: selecting text in a settings input and releasing outside must not dismiss it
     window.addEventListener('mousedown', (e) => {
       if (!this.settingsOpen) return
+      if (this.confirmModal.open) return // a confirm is layered over the panel - don't re-trigger
       if (e.target.closest('.settings-pop') || e.target.closest('button[title="Settings"]')) return
       this.closeSettings()
     })
@@ -1138,7 +1421,11 @@ createApp({
       const loaded = files.filter((f) => this.store[f.name])
       if (loaded.length) {
         const saved = localStorage.getItem('cms.active')
-        this.active = loaded.some((f) => f.name === saved) ? saved : loaded[0].name
+        // A persisted schema-sidecar tab is reopened if its sidecar file still exists
+        if (saved && this.sidecarOf(saved) && this.store[this.sidecarOf(saved)]) {
+          await this.loadFile(saved).catch(() => {})
+        }
+        this.active = this.store[saved] ? saved : loaded[0].name
         this.selPath = this.selPaths[this.active] || []
         this.sanitizeSelPath()
       }
@@ -1180,8 +1467,15 @@ createApp({
 
   methods: {
     /* ---------- loading / files ---------- */
+    /* A "<data>.schema.json" name is a schema sidecar: fetched/saved via the schema API,
+       shown as an ephemeral tab, edited with the exact same machinery as data files */
+    sidecarOf(name) {
+      return /\.schema\.json$/.test(name) ? name.replace(/\.schema\.json$/, '.json') : null
+    },
+
     async loadFile(name) {
-      const res = await fetch('/api/files/' + encodeURIComponent(name))
+      const dataName = this.sidecarOf(name)
+      const res = await fetch(dataName ? '/api/schema/' + encodeURIComponent(dataName) : '/api/files/' + encodeURIComponent(name))
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
         throw new Error(data.error || `${res.status} ${res.statusText}`)
@@ -1207,11 +1501,153 @@ createApp({
         // Change journal: first-touch original value per edited path. Lets huge files
         // diff in O(edits) instead of O(file). `structural` marks ops that can shift
         // sibling paths (array splices etc.) - those fall back to the text diff.
-        journal: { paths: new Map(), structural: false }
+        journal: { paths: new Map(), structural: false },
+        schema: null, // sidecar <name>.schema.json, fetched in the background below
+        sidecar: dataName // set when THIS entry is a schema sidecar (name of its data file)
       }
       this.dirtyMap[name] = false
       if (!this.undoStacks[name]) this.undoStacks[name] = { undo: [], redo: [] }
       this.invalidateIndexes()
+      if (!dataName) this.loadSchema(name) // schemas don't have schemas
+    },
+
+    /* Pathbar gear: toggles the schema view for the current file. Schema exists → open
+       it (as it is now); doesn't exist → open an empty sidecar and ask how to start. */
+    gearClick() {
+      if (this.activeIsSidecar) {
+        // Already in the schema - the gear toggles back to the data file
+        this.openFile(this.store[this.active].sidecar)
+        return
+      }
+      if (this.fileSchema) {
+        this.openSchemaFile()
+        return
+      }
+      const name = this.schemaFileName
+      if (!this.store[name]) {
+        // In-memory only until the first save (PUT creates the sidecar file). The empty
+        // draft baselines as CLEAN ({} vs {}), so an abandoned draft - or a fill undone
+        // back to empty - never trips the unsaved-changes guard.
+        this.store[name] = {
+          doc: {},
+          diskText: '{}',
+          prettyBase: serialize({}),
+          eol: '\n',
+          compact: false,
+          trailNL: true,
+          journal: { paths: new Map(), structural: true },
+          schema: null,
+          sidecar: this.active
+        }
+        this.dirtyMap[name] = false
+        if (!this.undoStacks[name]) this.undoStacks[name] = { undo: [], redo: [] }
+        this.schemaAsk = true
+      }
+      this.openFile(name)
+    },
+
+    schemaAskDerive() {
+      const dataName = this.store[this.active].sidecar
+      this.snapshot()
+      Object.assign(this.doc, this.derivedSchemaObject(dataName))
+      this.selPath = []
+      this.refreshDirty()
+      this.schemaAsk = false
+      this.toast('Schema derived - review and save (Ctrl+S) to write ' + this.active)
+    },
+
+    schemaAskSkeleton() {
+      const dataName = this.store[this.active].sidecar
+      const root = this.store[dataName].doc
+      const skeleton = { $schema: 'http://json-schema.org/draft-07/schema#', title: '', type: typeOf(root) }
+      if (Array.isArray(root)) skeleton.items = {}
+      else if (typeOf(root) === 'object') skeleton.properties = {}
+      this.snapshot()
+      Object.assign(this.doc, skeleton)
+      this.selPath = []
+      this.refreshDirty()
+      this.schemaAsk = false
+    },
+
+    schemaAskCancel() {
+      this.schemaAsk = false
+      const name = this.active
+      this.dirtyMap[name] = false
+      this.closeSchemaTab(name)
+    },
+
+    derivedSchemaObject(dataName) {
+      return {
+        $schema: 'http://json-schema.org/draft-07/schema#',
+        title: this.shortName(dataName),
+        ...deriveRootSchema(this.store[dataName].doc, this.idFieldsList)
+      }
+    },
+
+    /* Open the active file's schema sidecar as an ephemeral tab in the full editor */
+    async openSchemaFile() {
+      const name = this.schemaFileName
+      if (!this.store[name]) {
+        try {
+          await this.loadFile(name)
+        } catch (e) {
+          this.toast('Could not open ' + name + ': ' + e.message, 'error')
+          return
+        }
+      }
+      this.openFile(name)
+    },
+
+    async closeSchemaTab(name) {
+      if (this.dirtyMap[name] && !(await this.confirmAsk('Discard unsaved changes to ' + name + '?'))) return
+      const dataName = this.store[name].sidecar
+      if (this.active === name) {
+        this.openFile(this.store[dataName] ? dataName : this.files[0].name)
+      }
+      delete this.store[name]
+      delete this.dirtyMap[name]
+      delete this.selPaths[name]
+      this.invalidateIndexes()
+    },
+
+    /* Refresh button on a schema tab: confirm (it overwrites hand edits) then re-derive */
+    async askRederive() {
+      const dataName = this.store[this.active].sidecar
+      if (!this.store[dataName]) return
+      const ok = await this.confirmAsk(
+        `Replace this schema with one freshly derived from ${dataName}?\n\nAny hand edits here (added enum options, descriptions, tweaked types) will be overwritten. You can undo it, and nothing is written to disk until you review the diff and save.`,
+        { danger: false, confirmLabel: 'Re-derive' }
+      )
+      if (ok) this.rederiveSidecar()
+    },
+
+    /* Replace the open sidecar's contents with a fresh derivation from its data file's
+       current in-memory doc. A normal snapshot edit - nothing hits disk until save. */
+    rederiveSidecar() {
+      const dataName = this.store[this.active].sidecar
+      if (!this.store[dataName]) return
+      this.snapshot()
+      const schema = this.derivedSchemaObject(dataName)
+      const doc = this.doc
+      for (const k of Object.keys(doc)) delete doc[k]
+      Object.assign(doc, schema)
+      this.selPath = []
+      this.refreshDirty()
+      this.toast('Re-derived from ' + dataName + ' - review the diff on save')
+    },
+
+
+
+    /* Fire-and-forget: a missing schema is the normal case (404) */
+    async loadSchema(name) {
+      try {
+        const res = await fetch('/api/schema/' + encodeURIComponent(name))
+        if (!res.ok) return
+        const schema = JSON.parse(await res.text())
+        if (this.store[name]) this.store[name].schema = schema
+      } catch {
+        /* unreadable or invalid schema - behave as if none exists */
+      }
     },
 
     /* Drop both derived indexes and abandon any in-flight chunked build or scan */
@@ -1415,7 +1851,9 @@ createApp({
       const el = this.$refs.strEditor
       if (el) {
         el.style.height = 'auto'
-        el.style.height = Math.min(el.scrollHeight + 2, 400) + 'px'
+        // Cap at ~28% of the window: large editor + large preview share the side panel
+        // in roughly equal parts (the preview carries the same cap in CSS)
+        el.style.height = Math.min(el.scrollHeight + 2, Math.round(window.innerHeight * 0.28)) + 'px'
       }
     },
 
@@ -1565,7 +2003,7 @@ createApp({
       p.timer = setTimeout(() => this.offerIdRename(p), 1200)
     },
 
-    offerIdRename(p) {
+    async offerIdRename(p) {
       if (this._idRename === p) this._idRename = null
       const s = this.store[p.file]
       if (!s) return
@@ -1573,9 +2011,9 @@ createApp({
       if (typeof newId !== 'string' || !newId || newId === p.oldId) return
       const n = p.refs.length
       if (
-        !window.confirm(
+        !(await this.confirmAsk(
           `${n} reference${n === 1 ? '' : 's'} still point${n === 1 ? 's' : ''} at the old id "${p.oldId}".\n\nUpdate ${n === 1 ? 'it' : 'them'} to "${newId}" as well?`
-        )
+        ))
       )
         return
       const byFile = new Map()
@@ -1620,6 +2058,54 @@ createApp({
       return typeof v === 'string' && IMG_RE.test(v)
     },
 
+    isMarkdown(v) {
+      return typeof v === 'string' && looksMarkdown(v)
+    },
+
+    markdownHtml(v) {
+      return renderMarkdown(v)
+    },
+
+    /* Image preview metadata: dimensions from the loaded element; byte size fetched for
+       locally-served files only (the request hits the browser cache; remote hosts would
+       need CORS). Keyed by resolved src so the fields overview shares the cache. */
+    onImgLoad(e) {
+      const img = e.target
+      const src = img.getAttribute('src')
+      if (!src || this.imgMeta[src]) return
+      const meta = { w: img.naturalWidth, h: img.naturalHeight, bytes: null }
+      this.imgMeta = { ...this.imgMeta, [src]: meta }
+      if (src.startsWith('/site/')) {
+        fetch(src)
+          .then((r) => (r.ok ? r.blob() : null))
+          .then((b) => {
+            if (b) this.imgMeta = { ...this.imgMeta, [src]: { ...meta, bytes: b.size } }
+          })
+          .catch(() => {})
+      }
+    },
+
+    /* Write the loaded image's dimensions/byte-size into the sibling width/height/size
+       keys. size respects its current shape: a string field gets "454 KB", a number
+       gets raw bytes. One snapshot, so a single undo reverts all of them. */
+    fillImageMeta() {
+      const targets = this.imageMetaTargets
+      if (!targets) return
+      const parent = getNode(this.doc, this.selPath.slice(0, -1))
+      this.snapshot()
+      for (const t of targets) {
+        parent[t.key] = t.kind === 'size' && typeof parent[t.key] === 'string' ? this.fmtSize(t.value) : t.value
+      }
+      this.refreshDirty()
+      this.toast('Filled ' + targets.map((t) => t.key).join(', ') + ' from the image')
+    },
+
+    imgMetaLabel(src) {
+      const m = this.imgMeta[src]
+      if (!m || !m.w) return ''
+      return m.w + ' × ' + m.h + ' px' + (m.bytes ? ' · ' + this.fmtSize(m.bytes) : '')
+    },
+
     /* Per-field media preview for the Fields overview: the visual kinds the main
        preview computed handles (image / local video / YouTube-Vimeo embed) */
     fieldMedia(v) {
@@ -1629,6 +2115,74 @@ createApp({
       const embed = videoEmbed(v)
       if (embed) return { kind: 'embed', embedUrl: embed }
       return null
+    },
+
+    /* ---------- JSON Schema (sidecar <name>.schema.json) ---------- */
+
+    /* Resolve a local $ref ("#/$defs/x", "#/definitions/x") against the schema root */
+    schemaDeref(node, root, depth = 0) {
+      if (!node || typeof node !== 'object' || depth > 8) return node
+      if (typeof node.$ref === 'string' && node.$ref.startsWith('#/')) {
+        let cur = root
+        for (const seg of node.$ref.slice(2).split('/')) {
+          cur = cur && typeof cur === 'object' ? cur[seg.replace(/~1/g, '/').replace(/~0/g, '~')] : undefined
+        }
+        return this.schemaDeref(cur, root, depth + 1)
+      }
+      return node
+    },
+
+    /* Sub-schema for a document path: objects via properties (falling back to
+       additionalProperties), arrays via items. Returns null when the schema doesn't
+       describe that far down - jotson respects what's there, it never enforces. */
+    schemaAt(path) {
+      const s = this.store[this.active]
+      if (!s || !s.schema) return null
+      const root = s.schema
+      let node = this.schemaDeref(root, root)
+      for (const seg of path) {
+        if (!node || typeof node !== 'object') return null
+        if (typeof seg === 'number') {
+          node = this.schemaDeref(Array.isArray(node.items) ? node.items[seg] : node.items, root)
+        } else {
+          let next = node.properties && node.properties[seg]
+          if (next === undefined && node.additionalProperties && typeof node.additionalProperties === 'object') {
+            next = node.additionalProperties
+          }
+          node = this.schemaDeref(next, root)
+        }
+      }
+      return node && typeof node === 'object' ? node : null
+    },
+
+    /* String-enum options for a path, or null. `const` counts as a one-option enum.
+       Only all-string enums render as dropdowns - mixed/numeric enums stay free-form. */
+    enumAt(path) {
+      // Editing a schema itself: the meta-schema makes a string `type` field a dropdown of
+      // JSON Schema types. (An array-valued `type` stays an array, so only the string form
+      // hits this; a `type` under `properties` is an object, never a string.)
+      if (this.activeIsSidecar && path.length && path[path.length - 1] === 'type') return SCHEMA_TYPE_VALUES
+      const node = this.schemaAt(path)
+      if (!node) return null
+      const list = Array.isArray(node.enum) ? node.enum : typeof node.const === 'string' ? [node.const] : null
+      if (!list || !list.length || !list.every((x) => typeof x === 'string')) return null
+      return list
+    },
+
+    /* Keyword -> starter-value map for "+ Add key" on the schema node at `path`. null
+       when not editing a schema, or when the target is a properties/$defs container
+       (whose keys are user-defined names, not keywords). Keys already present are dropped. */
+    schemaKeyDefaults(path) {
+      if (!this.activeIsSidecar) return null
+      if (path.length && SCHEMA_NAME_CONTAINERS.has(path[path.length - 1])) return null
+      const node = getNode(this.doc, path)
+      if (node === null || typeof node !== 'object' || Array.isArray(node)) return null
+      const out = { ...SCHEMA_KEYWORDS.common }
+      const t = typeof node.type === 'string' ? node.type : null
+      if (t && SCHEMA_KEYWORDS[t]) Object.assign(out, SCHEMA_KEYWORDS[t])
+      if (!path.length) Object.assign(out, SCHEMA_KEYWORDS.root)
+      for (const k of Object.keys(node)) delete out[k]
+      return Object.keys(out).length ? out : null
     },
 
     /* Per-field link row (badge + anchor), mirroring the main preview's url kind.
@@ -1701,17 +2255,18 @@ createApp({
       this.refreshDirty()
     },
 
-    changeType(e) {
+    async changeType(e) {
       const t = e.target.value
       if (!this.selPath.length || !this.selected) return
       const cur = this.selected.value
       const curT = this.selected.type
       if (t === curT) return
+      if (t !== 'string') this.stringTypeOverride = null // leaving the manual-string state
       // Converting a non-empty container destroys its contents - confirm first
       if (curT === 'object' || curT === 'array') {
         const count = curT === 'array' ? cur.length : Object.keys(cur).length
         const what = curT === 'array' ? 'items' : 'keys'
-        if (count && !window.confirm(`Convert this ${curT} (${count} ${what}) to ${t}? Its contents will be lost.`)) {
+        if (count && !(await this.confirmAsk(`Convert this ${curT} (${count} ${what}) to ${t}? Its contents will be lost.`))) {
           e.target.value = curT // roll the dropdown back
           return
         }
@@ -1721,7 +2276,12 @@ createApp({
       if (t === 'string') {
         if (curT === 'file') this.fileTypeOverride = null
         if (curT === 'reference') this.refTypeOverride = null
-        if (curT === 'date' || curT === 'datetime' || curT === 'color' || curT === 'file' || curT === 'reference') return // already a string; detection is automatic
+        if (curT === 'date' || curT === 'datetime' || curT === 'color' || curT === 'file' || curT === 'reference') {
+          // Already a string in JSON - honor the manual choice by suppressing the
+          // value-based detection until the selection moves elsewhere
+          this.stringTypeOverride = this.active + ':' + this.selPath.join('/')
+          return
+        }
         v = curT === 'object' || curT === 'array' ? JSON.stringify(cur) : String(cur ?? '')
       } else if (t === 'file') {
         // Keep the string; the file editor takes over (upload sets a detectable path)
@@ -1954,9 +2514,9 @@ createApp({
       const total = orphans.reduce((s, f) => s + f.size, 0)
       const n = orphans.length
       if (
-        !window.confirm(
+        !(await this.confirmAsk(
           `Delete ${n} unused upload${n === 1 ? '' : 's'} (${this.fmtSize(total)}) from the upload directory?\n\nThis removes the files from disk immediately.`
-        )
+        ))
       )
         return
       try {
@@ -2034,12 +2594,45 @@ createApp({
     addKeyAt(ci) {
       this.addingKeyAt = ci
       this.addKeyDraft = ''
+      this.addKeyHi = -1
       this.$nextTick(() => {
         // refs inside v-for are arrays; only one inline input exists at a time
         const el = this.$refs.inlineKeyInput
         const input = Array.isArray(el) ? el[0] : el
-        if (input) input.focus()
+        if (!input) return
+        input.focus()
+        // Anchor the suggestion menu to the input (viewport coords + fixed positioning
+        // escapes the column's overflow). Drop up when there isn't room below.
+        const r = input.getBoundingClientRect()
+        const MENU_MAX = 260
+        const dropUp = window.innerHeight - r.bottom < MENU_MAX + 16
+        this.addKeyMenu = {
+          x: r.left,
+          y: dropUp ? window.innerHeight - r.top + 4 : r.bottom + 4,
+          w: r.width,
+          drop: dropUp ? 'up' : 'down'
+        }
       })
+    },
+
+    /* Move the suggestion highlight; -1 stays "commit typed text" */
+    addKeyNav(dir) {
+      const list = this.filteredAddKeys
+      if (!list || !list.length) return
+      const n = list.length
+      this.addKeyHi = this.addKeyHi < 0 && dir < 0 ? n - 1 : (this.addKeyHi + dir + n) % n
+    },
+
+    /* Enter: take the highlighted suggestion if one is active, else the typed text */
+    addKeyEnter(ci) {
+      const list = this.filteredAddKeys
+      if (list && this.addKeyHi >= 0 && this.addKeyHi < list.length) this.pickAddKey(ci, list[this.addKeyHi])
+      else this.commitAddKey(ci)
+    },
+
+    pickAddKey(ci, k) {
+      this.addKeyDraft = k
+      this.commitAddKey(ci)
     },
 
     commitAddKey(ci) {
@@ -2058,7 +2651,11 @@ createApp({
         return
       }
       this.snapshot()
-      obj[name] = name === 'id' ? genId() : ''
+      // Schema keyword? Seed its idiomatic starter value. Else data "id" gets a uuid.
+      const kw = this.schemaKeyDefaults(this.selPath.slice(0, ci))
+      if (kw && name in kw) obj[name] = clone(kw[name])
+      else if (!this.activeIsSidecar && name === 'id') obj[name] = genId()
+      else obj[name] = ''
       this.addingKeyAt = null
       this.addKeyDraft = ''
       // Select the new key so the inspector edits IT, not the parent object
@@ -2139,7 +2736,7 @@ createApp({
     },
 
     /* Copy the selected key (and value) into a sibling array item, e.g. Homecoming.featured → CONTINUUM */
-    dupIntoSibling(destIndex) {
+    async dupIntoSibling(destIndex) {
       this.ctxMenu.open = false
       const key = String(this.selPath[this.selPath.length - 1])
       const arrPath = this.selPath.slice(0, -2)
@@ -2149,7 +2746,7 @@ createApp({
       if (dest === null || typeof dest !== 'object' || Array.isArray(dest)) return
       const destLabel = friendlyLabel(dest, this.labelFields) || `[${destIndex}]`
       const exists = key in dest
-      if (exists && !window.confirm(`"${key}" already exists in "${destLabel}". Overwrite its value?`)) return
+      if (exists && !(await this.confirmAsk(`"${key}" already exists in "${destLabel}". Overwrite its value?`))) return
       this.snapshot()
       const value = regenerateIds(clone(src[key]))
       if (exists) {
@@ -2199,6 +2796,29 @@ createApp({
       this.deleteNode()
     },
 
+    /* Promise-based in-app replacement for window.confirm. Native dialogs are
+       unreliable - disabled outright in embedded preview browsers, and suppressible in
+       real ones after repeated prompts - and a silently-false confirm makes destructive
+       actions no-op with zero feedback. Returns a Promise<boolean>. */
+    confirmAsk(message, opts = {}) {
+      return new Promise((resolve) => {
+        this.confirmModal = {
+          open: true,
+          message,
+          danger: opts.danger !== false,
+          confirmLabel: opts.confirmLabel || 'Confirm',
+          _resolve: resolve
+        }
+        this.$nextTick(() => this.$refs.confirmOk && this.$refs.confirmOk.focus())
+      })
+    },
+
+    confirmResolve(v) {
+      const r = this.confirmModal._resolve
+      this.confirmModal = { open: false, message: '', danger: true, confirmLabel: 'Confirm', _resolve: null }
+      if (r) r(v)
+    },
+
     /* Duplicate an object key as a sibling right below it: "key" -> "keyCopy" */
     duplicateKey() {
       if (!this.selPath.length || this.parentIsArray) return
@@ -2232,7 +2852,7 @@ createApp({
       this.toast('Duplicated with fresh id fields (values otherwise copied)')
     },
 
-    deleteNode() {
+    async deleteNode() {
       if (!this.selPath.length) return
       const label = this.segLabel(this.selPath[this.selPath.length - 1], this.selPath.length - 1)
       const node = getNode(this.doc, this.selPath)
@@ -2269,12 +2889,12 @@ createApp({
       const warn = refs.length
         ? `\n\n⚠ Referenced by ${refs.length} value${refs.length === 1 ? '' : 's'} elsewhere.`
         : ''
-      if (!window.confirm(`Delete "${label}"?${warn}`)) return
+      if (!(await this.confirmAsk(`Delete "${label}"?${warn}`, { confirmLabel: 'Delete' }))) return
       const cleanup =
         refs.length > 0 &&
-        window.confirm(
+        (await this.confirmAsk(
           `Also delete the ${refs.length} reference${refs.length === 1 ? '' : 's'} to it?\n\nArray entries are removed; key values are blanked to "".`
-        )
+        ))
       this.snapshot()
       const parent = getNode(this.doc, this.selPath.slice(0, -1))
       const key = this.selPath[this.selPath.length - 1]
@@ -2389,7 +3009,7 @@ createApp({
     },
 
     /* ---------- raw view ---------- */
-    setView(v) {
+    async setView(v) {
       if (v === this.view) return
       if (v === 'raw') {
         const s = this.store[this.active]
@@ -2399,7 +3019,7 @@ createApp({
         }
       }
       if (v !== 'raw' && this.rawohanged && !this.rawError) {
-        if (window.confirm('Apply raw edits to the document?')) this.applyRaw()
+        if (await this.confirmAsk('Apply raw edits to the document?', { danger: false, confirmLabel: 'Apply' })) this.applyRaw()
       }
       // Set the view first so the render is queued before enterRaw's $nextTick -
       // otherwise the callback fires before the textarea exists.
@@ -2717,11 +3337,16 @@ createApp({
         }
         const writeText = this.pendingWriteText || this.pendingSaveText
         const outText = s.eol === '\r\n' ? writeText.replace(/\n/g, '\r\n') : writeText
-        await api('/api/files/' + encodeURIComponent(this.active), {
+        const saveUrl = s.sidecar
+          ? '/api/schema/' + encodeURIComponent(s.sidecar) // sidecar tabs write through the schema API
+          : '/api/files/' + encodeURIComponent(this.active)
+        await api(saveUrl, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
           body: outText // raw text - no envelope to double-parse on either end
         })
+        // A saved schema takes effect immediately: refresh the data file's live copy
+        if (s.sidecar && this.store[s.sidecar]) this.store[s.sidecar].schema = JSON.parse(writeText)
         s.diskText = writeText // what's on disk (minified for compact files)
         // Pretty baseline: for huge compact saves pendingSaveText IS the minified text
         // (the pretty conversion was skipped) - leave it null for lazy recompute instead
@@ -2783,9 +3408,9 @@ createApp({
       else this.settingsOpen = true
     },
 
-    closeSettings() {
+    async closeSettings() {
       if (this.cfgDirty) {
-        if (window.confirm('You have unsaved config changes. Save them?')) {
+        if (await this.confirmAsk('You have unsaved config changes. Save them?', { danger: false, confirmLabel: 'Save' })) {
           this.saveConfig()
           return // saveConfig closes the panel on success, stays open on failure
         }
@@ -2798,7 +3423,7 @@ createApp({
       const dirsohanged =
         this.cfgDraft.jsonDir !== this.config.jsonDir || this.cfgDraft.publicDir !== this.config.publicDir
       if (dirsohanged && Object.values(this.dirtyMap).some(Boolean)) {
-        if (!window.confirm('Changing directories reloads the app and discards unsaved edits. Continue?')) return
+        if (!(await this.confirmAsk('Changing directories reloads the app and discards unsaved edits. Continue?'))) return
       }
       const prevUploadDir = this.config.uploadDir || ''
       this.cfgSaving = true
@@ -2839,9 +3464,10 @@ createApp({
       const fromLabel = fromDir || '(public root)'
       const toLabel = this.config.uploadDir || '(public root)'
       if (
-        !window.confirm(
-          `Upload directory changed.\n\nMove existing uploads from "${fromLabel}" to "${toLabel}" and update all references?\n\nFiles move on disk immediately; the path updates land on your next save.`
-        )
+        !(await this.confirmAsk(
+          `Upload directory changed.\n\nMove existing uploads from "${fromLabel}" to "${toLabel}" and update all references?\n\nFiles move on disk immediately; the path updates land on your next save.`,
+          { danger: false, confirmLabel: 'Move' }
+        ))
       )
         return
       try {
@@ -2988,10 +3614,21 @@ createApp({
         this.requestSave()
         return
       }
+      // A layered confirm captures Enter (accept) and Escape (cancel) before anything else
+      if (this.confirmModal.open) {
+        if (e.key === 'Enter') {
+          e.preventDefault()
+          this.confirmResolve(true)
+        } else if (e.key === 'Escape') {
+          this.confirmResolve(false)
+        }
+        return
+      }
       if (e.key === 'Escape') {
         this.searchOpen = false
         this.diffOpen = false
         this.ctxMenu.open = false
+        if (this.schemaAsk) this.schemaAskCancel()
         if (this.settingsOpen) this.closeSettings()
         return
       }

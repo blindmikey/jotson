@@ -492,6 +492,38 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, await unfurl(target))
   }
 
+  // Schema sidecar for a data file: <name>.schema.json next to <name>.json. The dotted
+  // stem keeps schema files outside FILE_NAME_RE, so they never appear as editable tabs.
+  if (parts[1] === 'schema' && parts.length === 3) {
+    const name = decodeURIComponent(parts[2]) // the DATA file's name, e.g. records.json
+    if (!validName(name)) return sendJson(res, 400, { error: 'Invalid file name' })
+    const schemaPath = path.join(jsonDir(), name.replace(/\.json$/, '.schema.json'))
+
+    if (req.method === 'GET') {
+      try {
+        const text = await fs.readFile(schemaPath, 'utf8')
+        return send(res, 200, text, 'application/json; charset=utf-8')
+      } catch {
+        return sendJson(res, 404, { error: 'No schema for this file' })
+      }
+    }
+
+    if (req.method === 'PUT') {
+      // Unlike data files, schemas may be created here - that's the derive button's job
+      const text = await readBody(req)
+      try {
+        JSON.parse(text)
+      } catch (e) {
+        return sendJson(res, 400, { error: `Refusing to save invalid JSON: ${e.message}` })
+      }
+      await fs.writeFile(schemaPath, text, 'utf8')
+      return sendJson(res, 200, { ok: true, path: path.basename(schemaPath) })
+    }
+
+    // No DELETE: removing a schema is a file-manager job. Once the file is gone, the
+    // gear offers to derive a fresh one again (after the next reload).
+  }
+
   if (parts[1] === 'files' && parts.length === 3) {
     const name = decodeURIComponent(parts[2])
     if (!validName(name)) return sendJson(res, 400, { error: 'Invalid file name' })

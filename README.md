@@ -20,8 +20,9 @@
 
 - **Finder-style columns** - drill through your data with breadcrumbs, keyboard navigation,
   and browser back/forward across jumps.
-- **Smart types** - dates, datetimes, and colors get native pickers; images, videos, and
-  URLs get live previews (including server-side link unfurling).
+- **Smart types** - dates, datetimes, and colors get native pickers; images and videos
+  preview inline (with pixel dimensions and file size), external URLs unfurl into link
+  cards, and multi-line strings render as Markdown.
 - **File uploads** - point a key at local media, or upload straight from the editor:
   files land in your configured upload directory as collision-proof UUIDs and the
   site-relative path is stored. Includes unused-upload cleanup and directory migration.
@@ -29,8 +30,14 @@
   resolved labels in columns, a searchable picker, "referenced by" backlinks, and integrity
   guards that offer to update or clean references when ids are renamed or objects deleted.
   Enable in ⚙️ when your ids are globally unique.
-- **Full structural editing** - add/rename/reorder/duplicate/delete keys and items,
-  auto-generated UUID ids, per-file undo/redo, and an inline fields overview per object.
+- **Full structural editing** - add/rename/reorder/duplicate/delete keys and items (sort an
+  object's keys with one click), auto-generated UUID ids, per-file undo/redo, and an inline
+  fields overview where every field is editable with its full type-aware editor.
+- **Schema-aware** - if `records.json` has a `records.schema.json` beside it, jotson respects
+  it: string fields with an `enum` become dropdowns instead of free text. No schema yet? One
+  click derives one from your existing data, inferring dropdown options for fields whose
+  values repeat from a small set. Either way you can open and edit the schema inside jotson
+  itself, with the same columns, undo, and diff-confirmed saves as any other file.
 - **Safe saves** - every save shows a line diff for confirmation, preserves line endings
   for minimal git noise, and nothing touches disk until you say so.
 - **Fuzzy search** across every file (Ctrl+K), a syntax-highlighted raw view, dark/light
@@ -109,9 +116,39 @@ above apply and the first ⚙️ save creates `jotson.config.json` in your proje
 - Minified (single-line) files stay minified: you edit and diff in pretty-printed form,
   but saves write the file back as one line, preserving its format.
 - There is deliberately no backup system, the assumption is your data files live in git.
+- Destructive actions confirm through an in-app dialog (Enter to accept, Esc to cancel),
+  not the browser's native prompt, so a delete or type change never silently no-ops.
 - String `id` fields are auto-generated as UUIDs when adding/duplicating items.
 - Strings matching `YYYY-MM-DD` / ISO datetimes are treated as `date`/`datetime` types with
   native pickers and multi-format previews (RFC 3339, Unix, Unix ms, UTC, relative).
+- Multi-line strings that read as Markdown (headings, lists, bold, links, code fences, …)
+  render as formatted Markdown in the preview; plain prose keeps a text preview. The
+  renderer is dependency-free and escapes input before rendering, so it is injection-safe.
+- The per-object **fields overview** in the inspector edits every field inline with its
+  real editor: date/datetime/color pickers, the file uploader, the reference picker,
+  schema dropdowns, plus image/video/link previews - the same experience as selecting the
+  field directly, without leaving the object.
+- An object's keys can be reordered (↑/↓ in the inspector) or sorted with one click
+  (id fields first, then alphabetical). Key order is preserved through every edit and save.
+- Image previews show pixel dimensions and file size. If the image's object has sibling
+  keys named `width`/`height`/`size`, a "Fill … from image" button writes the real values
+  into them (matching each field's existing string-or-number shape).
+- Schema: a sidecar named `<file>.schema.json` in the same directory is picked up
+  automatically (it never appears as an editable tab). Jotson reads `properties`/`items`
+  (plus local `$ref`) to find each field's schema; an all-string `enum` (or string
+  `const`) renders as a dropdown. Values not in the enum stay selectable, marked
+  "⚠ not in schema". A **⛭ gear** at the left of the pathbar carries the schema state:
+  green when a schema exists, neutral when not. Clicking it opens the schema itself in
+  jotson - a closable extra tab with the full column editor, undo, and diff-confirmed
+  saves, so adding an enum option is the same three clicks as any other edit (while
+  open, a matching border wraps the gear and the schema file name). On a schema-less
+  file the gear offers to derive one from the current data (draft-07: `required`,
+  `integer`/`number`, date formats, and enums inferred only for short, repeating,
+  non-id string values) or start from a minimal skeleton; nothing is written until you
+  review and save. Saved schema changes apply to the data file's editors instantly, and
+  a re-derive button refreshes the schema from the data as an undoable edit. To remove a
+  schema, delete the sidecar file; jotson offers to generate a fresh one next time.
+  Schemas are respected, not enforced - saving never validates against them (yet).
 - Strings that look like local media paths (`/media/hero.png`) are treated as the `file`
   type: still a plain string, but with an Upload button. Uploads are copied into the upload
   directory renamed to a UUID, and the stored value becomes the site-relative path (so the

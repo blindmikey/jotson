@@ -26,11 +26,13 @@
     </div>
 
     <nav class="file-tabs">
+      <!-- A file's tab stays lit while its schema sidecar is being edited - the pathbar's
+           gear scope is the schema-mode indicator, not a separate tab -->
       <button
         v-for="f in files"
         :key="f.name"
         class="file-tab"
-        :class="{ active: f.name === active, dirty: isDirty(f.name) }"
+        :class="{ active: f.name === active || (store[active] && store[active].sidecar === f.name), dirty: isDirty(f.name) }"
         @click="openFile(f.name)"
       >
         {{ shortName(f.name) }}<span v-if="isDirty(f.name)" class="dirty-dot" title="Unsaved changes">●</span>
@@ -123,7 +125,21 @@
 
   <!-- ===== Path bar ===== -->
   <div v-if="view === 'columns' && doc !== undefined" class="pathbar">
-    <button class="crumb root" @click="selPath = []">{{ active }}</button>
+    <!-- Schema gear: green when a schema exists, neutral otherwise. Active (viewing the
+         schema) draws a border around gear + file name so the scope reads as one unit -->
+    <span class="gear-scope" :class="{ active: activeIsSidecar, has: schemaPresent }">
+      <button
+        class="gear-btn"
+        @click="gearClick"
+        :title="activeIsSidecar ? 'Back to ' + store[active].sidecar : schemaPresent ? 'Open ' + schemaFileName + ' for editing' : 'Set up a schema for ' + active + ' - fields with fixed value sets become dropdowns'"
+      >⛭</button>
+      <!-- In schema mode the whole scope is one toggle - clicking the name exits too;
+           the breadcrumb segments to the right still handle in-schema navigation -->
+      <button v-if="activeIsSidecar" class="crumb root" @click="gearClick" :title="'Back to ' + store[active].sidecar">{{ active }}</button>
+    </span>
+    <!-- Re-derive: its own button directly right of the gear scope, only in schema mode -->
+    <button v-if="activeIsSidecar" class="gear-btn schema-refresh" @click="askRederive" title="Re-derive this schema from the data file's current contents">↻</button>
+    <button v-if="!activeIsSidecar" class="crumb root" @click="selPath = []">{{ active }}</button>
     <template v-for="(seg, i) in selPath" :key="i">
       <span class="crumb-sep">›</span>
       <button class="crumb" @click="selPath = selPath.slice(0, i + 1)">{{ segLabel(seg, i) }}</button>
@@ -167,17 +183,40 @@
               ⋯ Show more <span class="cell-preview">{{ col.hidden.toLocaleString() }} hidden</span>
             </button>
             <div v-if="!col.total" class="empty-col">empty {{ col.type }}</div>
-            <input
-              v-if="addingKeyAt === ci"
-              ref="inlineKeyInput"
-              v-model="addKeyDraft"
-              class="addkey-inline"
-              placeholder="key name - Enter to add"
-              spellcheck="false"
-              @keydown.enter.prevent="commitAddKey(ci)"
-              @keydown.esc="cancelAddKey"
-              @blur="cancelAddKey"
-            />
+            <template v-if="addingKeyAt === ci">
+              <input
+                ref="inlineKeyInput"
+                v-model="addKeyDraft"
+                class="addkey-inline"
+                placeholder="key name - Enter to add"
+                spellcheck="false"
+                autocomplete="off"
+                @input="addKeyHi = -1"
+                @keydown.enter.prevent="addKeyEnter(ci)"
+                @keydown.down.prevent="addKeyNav(1)"
+                @keydown.up.prevent="addKeyNav(-1)"
+                @keydown.esc="cancelAddKey"
+                @blur="cancelAddKey"
+              />
+              <!-- Schema keyword suggestions: custom menu (context-menu styling), fixed-
+                   positioned below the input so column overflow never clips it; free text stays -->
+              <div
+                v-if="filteredAddKeys && filteredAddKeys.length"
+                class="ctx-menu addkey-menu"
+                :style="addKeyMenu.drop === 'up'
+                  ? { left: addKeyMenu.x + 'px', bottom: addKeyMenu.y + 'px', minWidth: addKeyMenu.w + 'px' }
+                  : { left: addKeyMenu.x + 'px', top: addKeyMenu.y + 'px', minWidth: addKeyMenu.w + 'px' }"
+              >
+                <button
+                  v-for="(k, i) in filteredAddKeys"
+                  :key="k"
+                  type="button"
+                  class="ctx-item"
+                  :class="{ hi: i === addKeyHi }"
+                  @mousedown.prevent="pickAddKey(ci, k)"
+                >{{ k }}</button>
+              </div>
+            </template>
             <button v-else class="cell add-cell" @click="col.type === 'array' ? addItemAt(ci) : addKeyAt(ci)">
               ＋ {{ col.type === 'array' ? 'Add item' : 'Add key' }}
             </button>
@@ -250,18 +289,27 @@
         <!-- Value editors (containers have none - root keeps the count note) -->
         <div class="insp-editor" v-if="!['object', 'array'].includes(selected.type) || !selPath.length">
           <template v-if="selected.type === 'string'">
-            <textarea
-              class="str-editor"
-              :value="selected.value"
-              @input="setValue($event.target.value)"
-              rows="1"
-              ref="strEditor"
-              spellcheck="false"
-            ></textarea>
-            <div v-if="isIdKey" class="op-group">
-              <button class="btn op" @click="generateId" title="Overwrite this id with a fresh uuid4">⚄ Generate UUID</button>
-            </div>
-            <div v-else class="hint">Use \n for line breaks in CTAs - actual newlines are saved as \n in JSON.</div>
+            <template v-if="schemaEnum">
+              <select class="enum-select" :value="selected.value" @change="setValue($event.target.value)">
+                <option v-if="!schemaEnum.includes(selected.value)" :value="selected.value">{{ selected.value === '' ? '(empty)' : selected.value }} ⚠ not in schema</option>
+                <option v-for="opt in schemaEnum" :key="opt" :value="opt">{{ opt }}</option>
+              </select>
+              <div class="hint">Allowed values from <code>{{ schemaFileName }}</code> - edit that file to change the options.</div>
+            </template>
+            <template v-else>
+              <textarea
+                class="str-editor"
+                :value="selected.value"
+                @input="setValue($event.target.value)"
+                rows="1"
+                ref="strEditor"
+                spellcheck="false"
+              ></textarea>
+              <div v-if="isIdKey" class="op-group">
+                <button class="btn op" @click="generateId" title="Overwrite this id with a fresh uuid4">⚄ Generate UUID</button>
+              </div>
+              <div v-else class="hint">Newlines are saved as \n in JSON. Markdown supported.</div>
+            </template>
           </template>
 
           <template v-else-if="selected.type === 'color'">
@@ -289,6 +337,11 @@
               <input ref="fileInput" type="file" hidden @change="uploadFile" />
             </div>
             <div class="hint">Uploads are copied into the upload directory as <code>&lt;uuid&gt;.&lt;ext&gt;</code> and the path is stored here. The path is editable (applies on Enter/blur).</div>
+            <div v-if="imageMetaTargets" class="op-group img-fill-row">
+              <button class="btn op" @click="fillImageMeta" title="Write the loaded image's dimensions and byte size into the matching sibling fields">
+                ⤵ Fill {{ imageMetaTargets.map(t => t.key).join(', ') }} from image
+              </button>
+            </div>
           </template>
 
           <template v-else-if="selected.type === 'reference'">
@@ -337,7 +390,8 @@
         <!-- Smart preview -->
         <div v-if="preview" class="smart-preview">
           <div class="sp-title">Preview</div>
-          <img v-if="preview.kind === 'image'" :src="preview.url" alt="" @error="preview.failed = true" />
+          <img v-if="preview.kind === 'image'" :src="preview.url" alt="" @load="onImgLoad" @error="preview.failed = true" />
+          <div v-if="preview.kind === 'image' && imgMetaLabel(preview.url)" class="img-meta">{{ imgMetaLabel(preview.url) }}</div>
           <video v-if="preview.kind === 'video'" :src="preview.url" controls muted playsinline></video>
           <div v-if="preview.kind === 'color'" class="sp-color"><span class="swatch" :style="{ background: preview.value }"></span></div>
           <div v-if="preview.kind === 'date'" class="sp-date">📅 {{ preview.human }}</div>
@@ -377,7 +431,14 @@
               </div>
             </a>
           </template>
-          <div v-if="preview.kind === 'multiline'" class="sp-multiline">{{ preview.value }}</div>
+          <!-- Multi-line strings that read as markdown render as markdown (escaped before
+               any tags are added, so v-html is safe); plain prose keeps the text preview -->
+          <div v-if="preview.kind === 'multiline' && isMarkdown(preview.value)" class="sp-markdown" v-html="markdownHtml(preview.value)"></div>
+          <!-- Blank lines split into paragraphs so a double break reads clearly bigger
+               than a single one (pre-line alone made the two too similar) -->
+          <div v-else-if="preview.kind === 'multiline'" class="sp-multiline">
+            <p v-for="(para, pi) in preview.value.split(/\n{2,}/)" :key="pi">{{ para }}</p>
+          </div>
         </div>
 
         <!-- Reverse references: everything that points at this id-bearing object -->
@@ -417,7 +478,11 @@
                   <button class="btn op" :disabled="uploading" @click="ofPickUpload(f.k)" title="Upload a file into this field">{{ uploading && ofUploadKey === f.k ? '…' : '⇪' }}</button>
                 </div>
                 <template v-else-if="fieldType(f.v, f.k) === 'string'">
-                  <textarea v-if="String(f.v).includes('\n')" class="of-input" rows="2" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false"></textarea>
+                  <select v-if="enumAt([...selPath, f.k])" class="of-input" :value="f.v" @change="setFieldValue(f.k, $event.target.value)">
+                    <option v-if="!enumAt([...selPath, f.k]).includes(f.v)" :value="f.v">{{ f.v === '' ? '(empty)' : f.v }} ⚠</option>
+                    <option v-for="opt in enumAt([...selPath, f.k])" :key="opt" :value="opt">{{ opt }}</option>
+                  </select>
+                  <textarea v-else-if="String(f.v).includes('\n')" class="of-input" rows="2" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false"></textarea>
                   <input v-else class="of-input" :value="f.v" @change="setFieldValue(f.k, $event.target.value)" spellcheck="false" />
                 </template>
                 <input v-else-if="fieldType(f.v, f.k) === 'number'" class="of-input" type="number" step="any" :value="f.v" @change="setFieldValue(f.k, $event.target.value === '' ? 0 : Number($event.target.value))" />
@@ -445,7 +510,8 @@
                 </div>
               </a>
               <div v-if="fieldMedia(f.v)" class="smart-preview">
-                <img v-if="fieldMedia(f.v).kind === 'image'" :src="fieldMedia(f.v).url" alt="" loading="lazy" />
+                <img v-if="fieldMedia(f.v).kind === 'image'" :src="fieldMedia(f.v).url" alt="" loading="lazy" @load="onImgLoad" />
+                <div v-if="fieldMedia(f.v).kind === 'image' && imgMetaLabel(fieldMedia(f.v).url)" class="img-meta">{{ imgMetaLabel(fieldMedia(f.v).url) }}</div>
                 <video v-else-if="fieldMedia(f.v).kind === 'video'" :src="fieldMedia(f.v).url" controls muted playsinline preload="metadata"></video>
                 <iframe
                   v-else-if="fieldMedia(f.v).kind === 'embed'"
@@ -591,6 +657,34 @@
         <span v-if="store[active] && store[active].compact" class="hint">Minified file - saved as a single line.</span>
         <button class="btn ghost" @click="diffOpen = false">Cancel</button>
         <button class="btn save" @click="confirmSave" :disabled="saving || diffPreparing">{{ saving ? 'Saving…' : diffPreparing ? 'Preparing…' : 'Save file' }}</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== "Create a schema?" prompt (gear on a schema-less file) ===== -->
+  <div v-if="schemaAsk" class="modal-scrim" @mousedown.self="schemaAskCancel">
+    <div class="modal schema-ask">
+      <div class="modal-title">No schema yet for <strong>{{ store[active] && store[active].sidecar }}</strong></div>
+      <div class="schema-ask-body">
+        Auto-create <code>{{ active }}</code> from the file's current data?
+        String fields whose values repeat from a small set become dropdown options; nothing
+        touches disk until you review and save.
+      </div>
+      <div class="modal-actions">
+        <button class="btn ghost" @click="schemaAskCancel">Cancel</button>
+        <button class="btn op" @click="schemaAskSkeleton" title="Start from a minimal skeleton and build the schema by hand">Start empty</button>
+        <button class="btn save" @click="schemaAskDerive">⛭ Derive from data</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Confirm dialog (in-app replacement for window.confirm) ===== -->
+  <div v-if="confirmModal.open" class="modal-scrim confirm-scrim" @mousedown.self="confirmResolve(false)">
+    <div class="modal confirm-modal">
+      <div class="confirm-body">{{ confirmModal.message }}</div>
+      <div class="modal-actions">
+        <button class="btn ghost" @click="confirmResolve(false)">Cancel</button>
+        <button ref="confirmOk" class="btn" :class="confirmModal.danger ? 'op danger' : 'save'" @click="confirmResolve(true)">{{ confirmModal.confirmLabel }}</button>
       </div>
     </div>
   </div>
