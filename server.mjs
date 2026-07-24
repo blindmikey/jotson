@@ -95,6 +95,10 @@ const CONFIG_DEFAULTS = {
   // Opt-in: reference detection is data-driven, so datasets with non-unique ids would
   // show spurious references out of the box
   references: false,
+  // Conditional-schema fill: when a discriminator field (e.g. a block's `type`) gains a
+  // value whose schema branch requires keys not yet present, offer to add them.
+  // 'ask' (default) prompts, 'auto' adds silently, 'off' disables.
+  schemaFill: 'ask',
 }
 
 // Internal branding - not part of the per-project config
@@ -323,6 +327,7 @@ async function handleApi(req, res, url) {
         next.idFields = fields.length ? fields : CONFIG_DEFAULTS.idFields
       }
       if (typeof body.references === 'boolean') next.references = body.references
+      if (['ask', 'auto', 'off'].includes(body.schemaFill)) next.schemaFill = body.schemaFill
       if (!(await isDirectory(path.resolve(ROOT, next.jsonDir)))) {
         return sendJson(res, 400, { error: `JSON directory not found: ${next.jsonDir}` })
       }

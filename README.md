@@ -100,6 +100,7 @@ tool's folder also works if no project-root config exists.
 | `labelFields` | Priority-ordered fields used to name objects in columns/breadcrumbs | see above |
 | `references` | Opt-in id-based reference detection. Leave off for datasets whose ids aren't globally unique (e.g. per-file incrementing numbers), which would show spurious references. Unavailable in projects with files over 20 MB | `false` |
 | `idFields` | Field names that identify objects as reference targets | `["id"]` |
+| `schemaFill` | For discriminated-union schemas: when a field's value makes the schema require more keys, `ask` (prompt), `auto` (add them), or `off` | `ask` |
 
 All of this is also editable in-app via the ⚙️ panel (directory changes are validated
 server-side; saves go to the resolved config path). If no config file exists, the defaults
@@ -149,6 +150,13 @@ above apply and the first ⚙️ save creates `jotson.config.json` in your proje
   a re-derive button refreshes the schema from the data as an undoable edit. To remove a
   schema, delete the sidecar file; jotson offers to generate a fresh one next time.
   Schemas are respected, not enforced - saving never validates against them (yet).
+- Conditional schemas (discriminated unions) work too: use `if`/`then` (in `allOf`) or
+  `oneOf` to say "a block of type `films` also needs `filmIds` and `grid`". jotson reads
+  the discriminator from the schema (never a hardcoded field name), gives the
+  conditionally-required keys their proper editors, and - when you set a type that pulls
+  in new required keys - offers to add them with schema-derived starter values (one
+  undoable step). Controlled by `schemaFill`: ask (default), auto, or off; the prompt can
+  remember your choice per project.
 - Strings that look like local media paths (`/media/hero.png`) are treated as the `file`
   type: still a plain string, but with an Upload button. Uploads are copied into the upload
   directory renamed to a UUID, and the stored value becomes the site-relative path (so the

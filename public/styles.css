@@ -598,6 +598,12 @@ body.resizing .columns { scroll-behavior: auto; }
 .confirm-scrim { z-index: 100; }
 .confirm-modal { max-width: 420px; }
 .confirm-body { padding: 1.1rem 1.2rem; font-size: 0.9rem; line-height: 1.5; white-space: pre-line; }
+.confirm-body p { margin: 0 0 0.6rem; }
+.confirm-body .hint { white-space: normal; }
+.fill-keys { margin: 0 0 0.7rem; padding-left: 1.2rem; display: flex; flex-direction: column; gap: 0.2rem; }
+.fill-keys code { background: var(--bg-raised); border-radius: 4px; padding: 0.05em 0.35em; }
+.fill-remember { display: flex; align-items: center; gap: 0.45rem; margin-top: 0.7rem; font-size: 0.82rem; color: var(--text-dim); cursor: pointer; }
+.fill-remember input { width: auto; accent-color: var(--indigo); }
 
 .unfurl-card {
   display: flex;

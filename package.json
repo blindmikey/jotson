@@ -1,6 +1,6 @@
 {
   "name": "@blindmikey/jotson",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Zero-dependency, drop-in editor for a project's JSON data files",
   "author": "blindmikey <github@blindmikey.com>",
   "keywords": [

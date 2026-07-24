@@ -114,6 +114,12 @@
       </template>
     </template>
     <span v-else class="hint cfg-check-hint">References are unavailable in this project - building the id index across files over 20 MB would freeze the app.</span>
+    <label>Schema-required keys <span class="hint">(when a field's value makes the schema require more keys)</span></label>
+    <select v-model="cfgDraft.schemaFill">
+      <option value="ask">Ask before adding them</option>
+      <option value="auto">Add them automatically</option>
+      <option value="off">Do nothing</option>
+    </select>
     <div class="op-group">
       <button class="btn" :class="cfgDirty ? 'save' : 'op'" :disabled="cfgSaving || !cfgDirty" @click="saveConfig">
         {{ cfgSaving ? 'Saving…' : cfgDirty ? 'Save config •' : 'Save config' }}
@@ -685,6 +691,24 @@
       <div class="modal-actions">
         <button class="btn ghost" @click="confirmResolve(false)">Cancel</button>
         <button ref="confirmOk" class="btn" :class="confirmModal.danger ? 'op danger' : 'save'" @click="confirmResolve(true)">{{ confirmModal.confirmLabel }}</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ===== Conditional-schema fill prompt ===== -->
+  <div v-if="schemaFillPrompt.open" class="modal-scrim confirm-scrim" @mousedown.self="confirmSchemaFill(false)">
+    <div class="modal confirm-modal">
+      <div class="confirm-body">
+        <p>Type <strong>{{ schemaFillPrompt.typeValue }}</strong> expects these keys, per the schema:</p>
+        <ul class="fill-keys">
+          <li v-for="k in schemaFillPrompt.keys" :key="k.key"><code>{{ k.key }}</code></li>
+        </ul>
+        <p class="hint">They'll be added with starter values (undoable). Existing values are never touched.</p>
+        <label class="fill-remember"><input type="checkbox" v-model="schemaFillPrompt.remember" /> Remember my choice for this project</label>
+      </div>
+      <div class="modal-actions">
+        <button class="btn ghost" @click="confirmSchemaFill(false)">Skip</button>
+        <button ref="confirmOk" class="btn save" @click="confirmSchemaFill(true)">Add {{ schemaFillPrompt.keys.length }} key{{ schemaFillPrompt.keys.length === 1 ? '' : 's' }}</button>
       </div>
     </div>
   </div>

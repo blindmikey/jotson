@@ -793,7 +793,7 @@ createApp({
       unfurl: { url: null, loading: false, data: null },
       unfurlTimer: null,
       inspWidth: Number(localStorage.getItem('cms.inspWidth')) || 360,
-      config: { jsonDir: '', publicDir: '', uploadDir: '', logo: null, logoLight: null, title: '', labelFields: 'title, label, name, id' },
+      config: { jsonDir: '', publicDir: '', uploadDir: '', logo: null, logoLight: null, title: '', labelFields: 'title, label, name, id', schemaFill: 'ask' },
       jotsonBrand: JOTSON_BRAND,
       configPath: 'jotson.config.json',
       version: null,
@@ -811,6 +811,7 @@ createApp({
       refTypeOverride: null, // "file:path" of a string manually switched to the reference type
       refPicker: { open: false, query: '', collection: null, sel: 0, field: null },
       confirmModal: { open: false, message: '', danger: true, confirmLabel: 'Confirm', _resolve: null },
+      schemaFillPrompt: { open: false, objPath: [], keys: [], typeValue: '', remember: false },
       fieldUnfurlTick: 0, // bumped when a Fields-overview unfurl arrives (cache itself is non-reactive)
       colLimits: {}, // "<file>|<column path>" -> extra rows granted via "show more"
       colStarts: {}, // "<file>|<column path>" -> window start granted via "show earlier"
@@ -818,7 +819,7 @@ createApp({
       diffTooBig: false,
       diffPreparing: false,
       diffUnits: 'lines', // 'characters' when a minified huge file diffs char-wise
-      cfgDraft: { jsonDir: '', publicDir: '', uploadDir: '', logo: '', logoLight: '', title: '', labelFields: '', idFields: '', references: false },
+      cfgDraft: { jsonDir: '', publicDir: '', uploadDir: '', logo: '', logoLight: '', title: '', labelFields: '', idFields: '', references: false, schemaFill: 'ask' },
       cfgSaving: false,
       labelFields: DEFAULT_LABEL_FIELDS,
       toasts: [],
@@ -1973,6 +1974,7 @@ createApp({
       parent[tailKey] = v
       this.refreshDirty()
       this.$nextTick(() => this.resizeStrEditor())
+      this.maybeOfferSchemaFill(this.selPath.slice(0, -1), tailKey)
     },
 
     /* Overwrite an id field with a fresh uuid4 (undoable; the reference-update offer
@@ -2140,12 +2142,26 @@ createApp({
       if (!s || !s.schema) return null
       const root = s.schema
       let node = this.schemaDeref(root, root)
-      for (const seg of path) {
+      for (let i = 0; i < path.length; i++) {
+        const seg = path[i]
         if (!node || typeof node !== 'object') return null
         if (typeof seg === 'number') {
           node = this.schemaDeref(Array.isArray(node.items) ? node.items[seg] : node.items, root)
         } else {
           let next = node.properties && node.properties[seg]
+          // Conditionally-defined property: resolve it from a matched branch, evaluated
+          // against the instance object at this level (discriminated-union support)
+          if (next === undefined && (node.allOf || node.oneOf)) {
+            const inst = getNode(this.doc, path.slice(0, i))
+            if (inst && typeof inst === 'object' && !Array.isArray(inst)) {
+              for (const { cond, add } of this.schemaBranches(node)) {
+                if (this.condMatches(cond, inst) && add.properties && seg in add.properties) {
+                  next = add.properties[seg]
+                  break
+                }
+              }
+            }
+          }
           if (next === undefined && node.additionalProperties && typeof node.additionalProperties === 'object') {
             next = node.additionalProperties
           }
@@ -2167,6 +2183,140 @@ createApp({
       const list = Array.isArray(node.enum) ? node.enum : typeof node.const === 'string' ? [node.const] : null
       if (!list || !list.length || !list.every((x) => typeof x === 'string')) return null
       return list
+    },
+
+    /* ---------- conditional schema (discriminated unions) ---------- */
+
+    /* Evaluate the const/enum/required subset of an `if`/branch condition against an
+       object. Unknown constraints are treated as non-matching (conservative - never
+       prompt on a branch we can't fully understand). */
+    condMatches(cond, obj) {
+      if (!cond || typeof cond !== 'object') return false
+      if (Array.isArray(cond.required) && !cond.required.every((k) => k in obj)) return false
+      const props = cond.properties
+      if (props) {
+        for (const k of Object.keys(props)) {
+          if (!(k in obj)) continue // absent property: constraint passes (JSON Schema)
+          const sub = props[k]
+          if (sub && 'const' in sub) {
+            if (obj[k] !== sub.const) return false
+          } else if (sub && Array.isArray(sub.enum)) {
+            if (!sub.enum.includes(obj[k])) return false
+          }
+          // other constraints on the discriminator are ignored for match purposes
+        }
+      }
+      return true
+    },
+
+    /* Normalize an object schema's conditionals into {cond, add} pairs: allOf `{if,then}`
+       and `oneOf` branches (a branch's own const/enum props act as its condition). */
+    schemaBranches(objSchema) {
+      const root = this.store[this.active].schema
+      const out = []
+      const push = (cond, add) => {
+        if (cond && add) out.push({ cond: this.schemaDeref(cond, root), add: this.schemaDeref(add, root) })
+      }
+      for (const item of Array.isArray(objSchema.allOf) ? objSchema.allOf : []) {
+        const b = this.schemaDeref(item, root)
+        if (b && b.if && b.then) push(b.if, b.then)
+      }
+      for (const item of Array.isArray(objSchema.oneOf) ? objSchema.oneOf : []) {
+        const b = this.schemaDeref(item, root)
+        if (b) push(b, b) // the branch discriminates itself and supplies the keys
+      }
+      return out
+    },
+
+    /* Field names any branch discriminates on (const/enum-constrained properties) */
+    discriminatorFields(objSchema) {
+      const fields = new Set()
+      for (const { cond } of this.schemaBranches(objSchema)) {
+        const props = cond && cond.properties
+        if (props) for (const k of Object.keys(props)) {
+          if (props[k] && ('const' in props[k] || Array.isArray(props[k].enum))) fields.add(k)
+        }
+      }
+      return fields
+    },
+
+    /* A schema-derived starter value for a required key (default/const/enum/type) */
+    starterFromSchema(sub) {
+      if (!sub || typeof sub !== 'object') return ''
+      if ('default' in sub) return clone(sub.default)
+      if ('const' in sub) return clone(sub.const)
+      if (Array.isArray(sub.enum) && sub.enum.length) return sub.enum[0]
+      const t = Array.isArray(sub.type) ? sub.type[0] : sub.type
+      return { array: [], object: {}, boolean: false, integer: 0, number: 0, null: null, string: '' }[t] ?? ''
+    },
+
+    /* Given the object's schema and current value, the required keys that matched
+       branches mandate but the object lacks, each with a schema-derived starter value. */
+    missingConditionalKeys(objSchema, obj) {
+      const root = this.store[this.active].schema
+      const need = []
+      const seen = new Set(Object.keys(obj))
+      for (const { cond, add } of this.schemaBranches(objSchema)) {
+        if (!this.condMatches(cond, obj)) continue
+        for (const k of Array.isArray(add.required) ? add.required : []) {
+          if (seen.has(k)) continue
+          seen.add(k)
+          const sub = (add.properties && add.properties[k]) || (objSchema.properties && objSchema.properties[k])
+          need.push({ key: k, value: this.starterFromSchema(this.schemaDeref(sub, root)) })
+        }
+      }
+      return need
+    },
+
+    /* After a value edit: if the edited key discriminates a conditional branch and the
+       now-matching branch requires keys the object lacks, act per the schemaFill setting
+       (ask / auto / off). Editing the schema itself never triggers this. */
+    maybeOfferSchemaFill(objPath, editedKey) {
+      if (this.config.schemaFill === 'off') return
+      if (this.activeIsSidecar || !this.store[this.active] || !this.store[this.active].schema) return
+      const obj = getNode(this.doc, objPath)
+      if (obj === null || typeof obj !== 'object' || Array.isArray(obj)) return
+      const objSchema = this.schemaAt(objPath)
+      if (!objSchema || !this.discriminatorFields(objSchema).has(editedKey)) return
+      const missing = this.missingConditionalKeys(objSchema, obj)
+      if (!missing.length) return
+      if (this.config.schemaFill === 'auto') {
+        this.applySchemaFill(objPath, missing)
+        return
+      }
+      this.schemaFillPrompt = { open: true, objPath: [...objPath], keys: missing, typeValue: obj[editedKey], remember: false }
+    },
+
+    /* Add the missing required keys (schema-derived starters) as one undoable edit */
+    applySchemaFill(objPath, keys) {
+      const obj = getNode(this.doc, objPath)
+      if (obj === null || typeof obj !== 'object') return
+      this.snapshot()
+      for (const { key, value } of keys) if (!(key in obj)) obj[key] = clone(value)
+      this.refreshDirty()
+      this.toast(`Added ${keys.map((k) => k.key).join(', ')} from schema`)
+    },
+
+    async confirmSchemaFill(accept) {
+      const p = this.schemaFillPrompt
+      this.schemaFillPrompt = { open: false, objPath: [], keys: [], typeValue: '', remember: false }
+      if (accept) this.applySchemaFill(p.objPath, p.keys)
+      if (p.remember) await this.persistSchemaFill(accept ? 'auto' : 'off')
+    },
+
+    /* Remember the ask/auto/off choice in the project config */
+    async persistSchemaFill(value) {
+      this.config = { ...this.config, schemaFill: value }
+      if (this.cfgDraft) this.cfgDraft.schemaFill = value
+      try {
+        await api('/api/config', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...this.config, labelFields: this.config.labelFields, idFields: this.config.idFields })
+        })
+      } catch (e) {
+        this.toast('Could not save preference: ' + e.message, 'error')
+      }
     },
 
     /* Keyword -> starter-value map for "+ Add key" on the schema node at `path`. null
@@ -2253,6 +2403,7 @@ createApp({
       this.snapshotLeaf([...this.selPath, key], 'field:' + this.selPath.join('/') + '/' + key)
       obj[key] = v
       this.refreshDirty()
+      this.maybeOfferSchemaFill([...this.selPath], key)
     },
 
     async changeType(e) {
@@ -3399,7 +3550,8 @@ createApp({
         title: config.title,
         labelFields: (config.labelFields || DEFAULT_LABEL_FIELDS).join(', '),
         idFields: (config.idFields || DEFAULT_ID_FIELDS).join(', '),
-        references: config.references === true
+        references: config.references === true,
+        schemaFill: config.schemaFill || 'ask'
       }
     },
 
@@ -3625,6 +3777,10 @@ createApp({
         return
       }
       if (e.key === 'Escape') {
+        if (this.schemaFillPrompt.open) {
+          this.confirmSchemaFill(false)
+          return
+        }
         this.searchOpen = false
         this.diffOpen = false
         this.ctxMenu.open = false
