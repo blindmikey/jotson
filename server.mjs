@@ -209,6 +209,10 @@ function readBodyRaw(req, maxBytes) {
 
 async function listDataFiles() {
   const entries = await fs.readdir(jsonDir())
+  // The sidecars are already in this listing (FILE_NAME_RE filters them out of the editable
+  // tabs below). A Set lets us flag hasSchema per file for free - no extra stat, so the
+  // client only fetches schemas that exist instead of probing every file with a 404.
+  const present = new Set(entries)
   const files = []
   // Only list names the read/write endpoints accept (FILE_NAME_RE), and never the
   // tool's own config, which shows up when jsonDir is the project root
@@ -216,7 +220,7 @@ async function listDataFiles() {
     const full = path.join(jsonDir(), name)
     if (full === CONFIG_PATH) continue
     const stat = await fs.stat(full)
-    files.push({ name, size: stat.size, mtime: stat.mtimeMs })
+    files.push({ name, size: stat.size, mtime: stat.mtimeMs, hasSchema: present.has(name.replace(/\.json$/, '.schema.json')) })
   }
   return files
 }
@@ -353,8 +357,9 @@ async function handleApi(req, res, url) {
   }
 
   // List uuid-named media files that nothing references. "Referenced" is the union of
-  // every data file on disk and the client's in-memory strings (body.referenced), so
-  // unsaved edits that point at a fresh upload keep it safe.
+  // every data file on disk, jotson's own config (logo/logoLight may point at an uploaded
+  // file), and the client's in-memory strings (body.referenced), so unsaved edits that
+  // point at a fresh upload keep it safe.
   if (req.method === 'POST' && parts[1] === 'media' && parts[2] === 'orphans' && parts.length === 3) {
     let body = {}
     try {
@@ -371,6 +376,7 @@ async function handleApi(req, res, url) {
     }
     if (!names.length) return sendJson(res, 200, { orphans: [] })
     let haystack = (Array.isArray(body.referenced) ? body.referenced : []).map(String).join('\n')
+    haystack += '\n' + JSON.stringify(config) // logo/logoLight etc. protect their uploads
     for (const f of await listDataFiles()) {
       haystack += '\n' + (await fs.readFile(path.join(jsonDir(), f.name), 'utf8'))
     }
@@ -425,7 +431,9 @@ async function handleApi(req, res, url) {
     return sendJson(res, 200, { ok: true, moved, from: sitePrefix(fromAbs), to: sitePrefix(toAbs) })
   }
 
-  // Delete named uuid media files (the client confirms with the user first)
+  // Remove named uuid media files (the client confirms with the user first). Either
+  // permanently deletes them, or - with body.trash - moves them to <root>/trash
+  // (created on demand) so they can be recovered.
   if (req.method === 'POST' && parts[1] === 'media' && parts[2] === 'clean' && parts.length === 3) {
     let body
     try {
@@ -433,17 +441,32 @@ async function handleApi(req, res, url) {
     } catch {
       return sendJson(res, 400, { error: 'Request body must be JSON' })
     }
+    const toTrash = body.trash === true
+    const trashDir = path.resolve(ROOT, 'trash')
+    if (toTrash) await fs.mkdir(trashDir, { recursive: true })
     const deleted = []
     for (const name of Array.isArray(body.files) ? body.files : []) {
       if (typeof name !== 'string' || !UUID_FILE_RE.test(name)) continue
+      const src = path.join(uploadDir(), name)
       try {
-        await fs.unlink(path.join(uploadDir(), name))
+        if (toTrash) {
+          const dest = path.join(trashDir, name)
+          try {
+            await fs.rename(src, dest)
+          } catch {
+            // cross-device or existing dest: fall back to copy + remove
+            await fs.copyFile(src, dest)
+            await fs.unlink(src)
+          }
+        } else {
+          await fs.unlink(src)
+        }
         deleted.push(name)
       } catch {
         /* already gone or locked - skip */
       }
     }
-    return sendJson(res, 200, { ok: true, deleted })
+    return sendJson(res, 200, { ok: true, deleted, trashed: toTrash })
   }
 
   // Copy an uploaded file into the upload dir as <uuid4>.<ext>; body is the raw file bytes.

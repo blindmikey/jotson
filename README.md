@@ -162,9 +162,10 @@ above apply and the first ⚙️ save creates `jotson.config.json` in your proje
   directory renamed to a UUID, and the stored value becomes the site-relative path (so the
   preview renders). Media-only allowlist, 100 MB cap.
 - Deleting a key never deletes the file it points to. Abandoned uploads are reclaimed via
-  ⚙️ → "Scan unused uploads", which lists UUID-named media files nothing references (unsaved
-  edits count as references) and deletes them only after confirmation. Files jotson didn't
-  create are never touched.
+  ⚙️ → "Scan unused uploads", which lists UUID-named media files nothing references (your
+  data files, an uploaded `logo`/`logoLight` in the config, and unsaved edits all count as
+  references) and deletes them only after confirmation. Files jotson didn't create are
+  never touched.
 - References: a string equal to some object's `id` (configurable via `idFields`) is treated
   as the `reference` type - columns show the resolved label (`→ Jane Doe`), the inspector
   shows a target card with a go-to link, and a picker modal (search or browse collections)

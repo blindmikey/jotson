@@ -20,6 +20,9 @@ const FILE_RE = /^(?!https?:\/\/)[^\n]+\.(png|jpe?g|webp|gif|svg|avif|ico|mp4|we
 const COLOR_RE = /^#([0-9a-f]{3}|[0-9a-f]{6})$/i
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
 const DATETIME_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?$/
+// Time of day, strict 24-hour HH:mm(:ss) with a two-digit hour 00-23. This keeps
+// single-digit m:ss durations ("3:48") as strings; "03:48:00" reads as a time.
+const TIME_RE = /^([01]\d|2[0-3]):[0-5]\d(:[0-5]\d)?$/
 
 function typeOf(v) {
   if (v === null) return 'null'
@@ -31,6 +34,7 @@ function typeOf(v) {
 function dateKind(v) {
   if (DATE_ONLY_RE.test(v)) return 'date'
   if (DATETIME_RE.test(v)) return 'datetime'
+  if (TIME_RE.test(v)) return 'time'
   return null
 }
 
@@ -744,7 +748,7 @@ function deriveRootSchema(doc, idFields) {
   return deriveValues([doc], '', idFields)
 }
 
-createApp({
+const app = createApp({
   data() {
     return {
       files: [],
@@ -810,8 +814,9 @@ createApp({
       refIndex: null, // { targets: Map<id, [{file,path,label,field}]>, referrers: Map<id, [{file,path}]> }
       refTypeOverride: null, // "file:path" of a string manually switched to the reference type
       refPicker: { open: false, query: '', collection: null, sel: 0, field: null },
-      confirmModal: { open: false, message: '', danger: true, confirmLabel: 'Confirm', _resolve: null },
+      confirmModal: { open: false, message: '', warn: '', danger: true, confirmLabel: 'Confirm', third: '', _resolve: null },
       schemaFillPrompt: { open: false, objPath: [], keys: [], typeValue: '', remember: false },
+      cleanupPrompt: { open: false, count: 0, size: 0 },
       fieldUnfurlTick: 0, // bumped when a Fields-overview unfurl arrives (cache itself is non-reactive)
       colLimits: {}, // "<file>|<column path>" -> extra rows granted via "show more"
       colStarts: {}, // "<file>|<column path>" -> window start granted via "show earlier"
@@ -874,6 +879,7 @@ createApp({
         'string',
         'color',
         'date',
+        'time',
         'datetime',
         'file',
         ...(this.refsEnabled ? ['reference'] : []),
@@ -1282,10 +1288,22 @@ createApp({
           }
         }
       }
-      if (/^https?:\/\//.test(v)) return { kind: 'url', value: v, url: v, internal: false }
-      if (/^\//.test(v)) return { kind: 'url', value: v, url: v, internal: true }
+      if (/^https?:\/\//.test(v)) return { kind: 'url', value: v, url: v }
+      // Root-relative routes (`/about`) can't be previewed or opened - jotson isn't the
+      // project's site and has no domain to resolve them against. (Relative *media* paths
+      // are handled above by IMG_RE/VID_RE.) No preview rather than a dead link.
       if (v.includes('\n')) return { kind: 'multiline', value: v }
       return null
+    },
+
+    /* Whether the smart-preview panel has anything to show. A `url` renders only its unfurl
+       card (or the loading hint) - no card, no panel, so a link without OpenGraph data or a
+       failed fetch leaves no empty "Preview" section. Every other kind always renders. */
+    showSmartPreview() {
+      const p = this.preview
+      if (!p) return false
+      if (p.kind === 'url') return this.unfurl.loading || !!(this.unfurl.data && (this.unfurl.data.title || this.unfurl.data.image))
+      return true
     },
 
     rawError() {
@@ -1509,12 +1527,17 @@ createApp({
       this.dirtyMap[name] = false
       if (!this.undoStacks[name]) this.undoStacks[name] = { undo: [], redo: [] }
       this.invalidateIndexes()
-      if (!dataName) this.loadSchema(name) // schemas don't have schemas
+      // Schemas don't have schemas. Only fetch when the files listing reports a sidecar
+      // (no 404 probing); if the file isn't in the listing yet, fall back to trying.
+      if (!dataName) {
+        const entry = this.files.find((f) => f.name === name)
+        if (!entry || entry.hasSchema !== false) this.loadSchema(name)
+      }
     },
 
     /* Pathbar gear: toggles the schema view for the current file. Schema exists → open
        it (as it is now); doesn't exist → open an empty sidecar and ask how to start. */
-    gearClick() {
+    async gearClick() {
       if (this.activeIsSidecar) {
         // Already in the schema - the gear toggles back to the data file
         this.openFile(this.store[this.active].sidecar)
@@ -1524,6 +1547,18 @@ createApp({
         this.openSchemaFile()
         return
       }
+      // The sidecar may have been added on disk (outside jotson) since boot, when we
+      // skipped fetching it. Re-check before scaffolding a draft, so the gear opens the
+      // real file instead of a blank one whose save would clobber it.
+      const dataName = this.active
+      if (await this.loadSchema(dataName)) {
+        if (this.active !== dataName) return // selection moved during the fetch
+        const entry = this.files.find((f) => f.name === dataName)
+        if (entry) entry.hasSchema = true
+        this.openSchemaFile()
+        return
+      }
+      if (this.active !== dataName) return
       const name = this.schemaFileName
       if (!this.store[name]) {
         // In-memory only until the first save (PUT creates the sidecar file). The empty
@@ -1640,14 +1675,18 @@ createApp({
 
 
     /* Fire-and-forget: a missing schema is the normal case (404) */
+    /* Fetch a data file's sidecar into its live copy. Returns true when one exists on disk
+       (so callers can tell "no schema" from "load failed"). */
     async loadSchema(name) {
       try {
         const res = await fetch('/api/schema/' + encodeURIComponent(name))
-        if (!res.ok) return
+        if (!res.ok) return false
         const schema = JSON.parse(await res.text())
         if (this.store[name]) this.store[name].schema = schema
+        return true
       } catch {
         /* unreadable or invalid schema - behave as if none exists */
+        return false
       }
     },
 
@@ -1749,23 +1788,40 @@ createApp({
       return `[${seg}]`
     },
 
+    /* Type-chip CSS class, value-aware so media (file/image/video) all read as one color:
+       a video-url string chips as `t-video` (same blue as `t-file`) rather than `t-string`. */
+    typeClass(t, v) {
+      if (t === 'string' && typeof v === 'string' && videoEmbed(v)) return 't-video'
+      return 't-' + t
+    },
+
+    /* Object/array keep their literal brace/bracket text glyph instead of an icon */
+    typeText(t, v) {
+      if (t === 'object') return '{}'
+      if (t === 'array') return '[]'
+      // string → quotes, unless the value is a video url (that keeps its film icon)
+      if (t === 'string' && !(typeof v === 'string' && videoEmbed(v))) return '“”'
+      return ''
+    },
+
+    /* Icon name (sprite id suffix) for a detected type; value-aware so a video url reads
+       as film. Used by the <icon> component in cells and the fields overview. */
     typeGlyph(t, v) {
-      // Value-aware special case: strings holding a YouTube/Vimeo url read as footage
-      if (t === 'string' && typeof v === 'string' && videoEmbed(v)) return '🎞️'
+      if (t === 'string' && typeof v === 'string' && videoEmbed(v)) return 'type-video'
+      if (t === 'file' && typeof v === 'string' && IMG_RE.test(v)) return 'type-image'
       return (
         {
-          string: '“ ”',
-          number: '#',
-          boolean: '◐',
-          null: '∅',
-          object: '{}',
-          array: '[]',
-          date: '📅',
-          datetime: '🕓',
-          color: '🎨',
-          file: '📂',
-          reference: '🔗'
-        }[t] || '?'
+          string: 'type-string',
+          number: 'type-number',
+          boolean: 'type-boolean',
+          null: 'type-null',
+          date: 'type-date',
+          time: 'type-time',
+          datetime: 'type-datetime',
+          color: 'type-color',
+          file: 'type-file',
+          reference: 'link'
+        }[t] || 'type-string'
       )
     },
 
@@ -2012,12 +2068,15 @@ createApp({
       const newId = getNode(s.doc, p.path)
       if (typeof newId !== 'string' || !newId || newId === p.oldId) return
       const n = p.refs.length
-      if (
-        !(await this.confirmAsk(
-          `${n} reference${n === 1 ? '' : 's'} still point${n === 1 ? 's' : ''} at the old id "${p.oldId}".\n\nUpdate ${n === 1 ? 'it' : 'them'} to "${newId}" as well?`
-        ))
+      const choice = await this.confirmAsk(
+        `${n} reference${n === 1 ? '' : 's'} still point${n === 1 ? 's' : ''} at the old id "${p.oldId}".\n\nUpdate ${n === 1 ? 'it' : 'them'} to "${newId}" as well?`,
+        { confirmLabel: 'Update', third: 'Undo' }
       )
+      if (choice === 'third') {
+        this.undo() // revert the id change itself
         return
+      }
+      if (!choice) return // cancel: keep the new id, leave the references as-is
       const byFile = new Map()
       for (const r of p.refs) {
         if (!byFile.has(r.file)) byFile.set(r.file, [])
@@ -2134,6 +2193,32 @@ createApp({
       return node
     },
 
+    /* Collapse a *structural* union (`oneOf`/`anyOf` whose branches split by JSON type,
+       e.g. `oneOf: [block, array-of-blocks]`) to the single branch matching the instance's
+       type, so the object's real schema - properties, required, and its own `allOf`
+       if/then conditionals - is reachable. A *discriminated* union (multiple branches of
+       the same type, distinguished by a const/enum property) is left intact for the
+       schemaBranches/condMatches path. */
+    collapseUnion(node, instance) {
+      const s = this.store[this.active]
+      const root = s && s.schema
+      node = this.schemaDeref(node, root)
+      if (!node || typeof node !== 'object') return node
+      const union = node.oneOf || node.anyOf
+      if (!Array.isArray(union) || !union.length) return node
+      const instType = typeOf(instance)
+      const fits = (b) => {
+        let t = Array.isArray(b.type) ? b.type : b.type != null ? [b.type] : null
+        if (!t) t = b.properties || b.required || b.allOf || b.additionalProperties ? ['object'] : b.items || b.prefixItems ? ['array'] : null
+        if (!t) return true // untyped branch: can't rule it out
+        return t.includes(instType) || (instType === 'number' && t.includes('integer'))
+      }
+      const matching = union.map((b) => this.schemaDeref(b, root)).filter((b) => b && typeof b === 'object' && fits(b))
+      // Exactly one branch fits the instance's JSON type => structural, collapse to it.
+      // Zero or several => discriminated/ambiguous, keep the union for condMatches.
+      return matching.length === 1 ? matching[0] : node
+    },
+
     /* Sub-schema for a document path: objects via properties (falling back to
        additionalProperties), arrays via items. Returns null when the schema doesn't
        describe that far down - jotson respects what's there, it never enforces. */
@@ -2141,7 +2226,7 @@ createApp({
       const s = this.store[this.active]
       if (!s || !s.schema) return null
       const root = s.schema
-      let node = this.schemaDeref(root, root)
+      let node = this.collapseUnion(this.schemaDeref(root, root), this.doc)
       for (let i = 0; i < path.length; i++) {
         const seg = path[i]
         if (!node || typeof node !== 'object') return null
@@ -2167,6 +2252,9 @@ createApp({
           }
           node = this.schemaDeref(next, root)
         }
+        // Collapse a structural union into the instance we just descended into, so its
+        // object schema (and nested conditionals) is what the next step - and the caller - sees.
+        node = this.collapseUnion(node, getNode(this.doc, path.slice(0, i + 1)))
       }
       return node && typeof node === 'object' ? node : null
     },
@@ -2390,6 +2478,12 @@ createApp({
       return String(v).slice(0, 16)
     },
 
+    /* Native time inputs need a zero-padded hour ("3:48" → "03:48") to display; the
+       stored value is left as-is until the user actually picks a new time */
+    timeInputValue(v) {
+      return String(v).replace(/^(\d):/, '0$1:')
+    },
+
     dtSuffixOf(v) {
       const s = String(v)
       return s.length > 16 ? s.slice(16) : ''
@@ -2427,7 +2521,7 @@ createApp({
       if (t === 'string') {
         if (curT === 'file') this.fileTypeOverride = null
         if (curT === 'reference') this.refTypeOverride = null
-        if (curT === 'date' || curT === 'datetime' || curT === 'color' || curT === 'file' || curT === 'reference') {
+        if (curT === 'date' || curT === 'time' || curT === 'datetime' || curT === 'color' || curT === 'file' || curT === 'reference') {
           // Already a string in JSON - honor the manual choice by suppressing the
           // value-based detection until the selection moves elsewhere
           this.stringTypeOverride = this.active + ':' + this.selPath.join('/')
@@ -2453,10 +2547,14 @@ createApp({
         }
       } else if (t === 'datetime') {
         if (curT === 'date') v = cur + 'T12:00'
+        else if (curT === 'time') v = toLocalDate(new Date()) + 'T' + String(cur).slice(0, 5)
         else {
           const d = new Date(cur)
           v = typeof cur === 'string' && !isNaN(d) ? toLocalDatetime(d) : toLocalDatetime(new Date())
         }
+      } else if (t === 'time') {
+        if (curT === 'datetime') v = String(cur).slice(11, 16) || '00:00'
+        else v = TIME_RE.test(String(cur)) ? String(cur) : new Date().toTimeString().slice(0, 5)
       } else if (t === 'number') v = Number(cur) || 0
       else if (t === 'boolean') v = cur === 'false' ? false : Boolean(cur)
       else if (t === 'null') v = null
@@ -2659,25 +2757,30 @@ createApp({
       }
     },
 
-    async cleanMedia() {
+    cleanMedia() {
       const orphans = this.mediaScan && this.mediaScan.orphans
       if (!orphans || !orphans.length) return
-      const total = orphans.reduce((s, f) => s + f.size, 0)
-      const n = orphans.length
-      if (
-        !(await this.confirmAsk(
-          `Delete ${n} unused upload${n === 1 ? '' : 's'} (${this.fmtSize(total)}) from the upload directory?\n\nThis removes the files from disk immediately.`
-        ))
-      )
-        return
+      this.cleanupPrompt = { open: true, count: orphans.length, size: orphans.reduce((s, f) => s + f.size, 0) }
+    },
+
+    /* trash=true moves the orphans to <root>/trash (recoverable); false deletes them */
+    async runCleanup(trash) {
+      this.cleanupPrompt.open = false
+      const orphans = this.mediaScan && this.mediaScan.orphans
+      if (!orphans || !orphans.length) return
       try {
         const { deleted } = await api('/api/media/clean', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ files: orphans.map((f) => f.name) })
+          body: JSON.stringify({ files: orphans.map((f) => f.name), trash })
         })
         this.mediaScan = null
-        this.toast(`Deleted ${deleted.length} unused upload${deleted.length === 1 ? '' : 's'}`)
+        const n = deleted.length
+        this.toast(
+          trash
+            ? `Moved ${n} upload${n === 1 ? '' : 's'} to /trash`
+            : `Deleted ${n} unused upload${n === 1 ? '' : 's'}`
+        )
       } catch (e) {
         this.toast('Clean failed: ' + e.message, 'error')
       }
@@ -2956,8 +3059,10 @@ createApp({
         this.confirmModal = {
           open: true,
           message,
+          warn: opts.warn || '', // optional warning line, shown with the warning icon
           danger: opts.danger !== false,
           confirmLabel: opts.confirmLabel || 'Confirm',
+          third: opts.third || '', // optional middle button; clicking it resolves 'third'
           _resolve: resolve
         }
         this.$nextTick(() => this.$refs.confirmOk && this.$refs.confirmOk.focus())
@@ -2966,7 +3071,7 @@ createApp({
 
     confirmResolve(v) {
       const r = this.confirmModal._resolve
-      this.confirmModal = { open: false, message: '', danger: true, confirmLabel: 'Confirm', _resolve: null }
+      this.confirmModal = { open: false, message: '', warn: '', danger: true, confirmLabel: 'Confirm', third: '', _resolve: null }
       if (r) r(v)
     },
 
@@ -3038,9 +3143,9 @@ createApp({
         }
       }
       const warn = refs.length
-        ? `\n\n⚠ Referenced by ${refs.length} value${refs.length === 1 ? '' : 's'} elsewhere.`
+        ? `Referenced by ${refs.length} value${refs.length === 1 ? '' : 's'} elsewhere.`
         : ''
-      if (!(await this.confirmAsk(`Delete "${label}"?${warn}`, { confirmLabel: 'Delete' }))) return
+      if (!(await this.confirmAsk(`Delete "${label}"?`, { confirmLabel: 'Delete', warn }))) return
       const cleanup =
         refs.length > 0 &&
         (await this.confirmAsk(
@@ -3496,8 +3601,14 @@ createApp({
           headers: { 'Content-Type': 'application/json' },
           body: outText // raw text - no envelope to double-parse on either end
         })
-        // A saved schema takes effect immediately: refresh the data file's live copy
+        // A saved schema takes effect immediately: refresh the data file's live copy and
+        // mark the listing so reopening the data file still fetches it (first save creates
+        // the sidecar, so the boot listing's hasSchema:false would otherwise be stale).
         if (s.sidecar && this.store[s.sidecar]) this.store[s.sidecar].schema = JSON.parse(writeText)
+        if (s.sidecar) {
+          const entry = this.files.find((f) => f.name === s.sidecar)
+          if (entry) entry.hasSchema = true
+        }
         s.diskText = writeText // what's on disk (minified for compact files)
         // Pretty baseline: for huge compact saves pendingSaveText IS the minified text
         // (the pretty conversion was skipped) - leave it null for lazy recompute instead
@@ -3777,6 +3888,10 @@ createApp({
         return
       }
       if (e.key === 'Escape') {
+        if (this.cleanupPrompt.open) {
+          this.cleanupPrompt.open = false
+          return
+        }
         if (this.schemaFillPrompt.open) {
           this.confirmSchemaFill(false)
           return
@@ -3844,4 +3959,30 @@ createApp({
       }
     }
   }
-}).mount('#app')
+})
+
+// Monochrome inline-SVG icons (sprite lives in index.html). Kept as a tiny global
+// component so markup stays `<icon name="search"/>` instead of raw <svg><use> everywhere.
+// Filled icons (Font Awesome, 640 grid) vs stroke icons (hand-drawn, 24 grid) get
+// different CSS; the set below marks which are filled. Move a name here when its symbol
+// is swapped to a filled glyph.
+// Filled (Font Awesome) icon names. Anything not listed uses the stroke style; only
+// `into` remains hand-drawn today (string/object/array render as text, not icons).
+const FILLED_ICONS = new Set([
+  'settings', 'sun', 'moon', 'search', 'undo', 'redo', 'link', 'sort', 'copy', 'pencil',
+  'broom', 'trash', 'refresh', 'x', 'chevron-up', 'chevron-down', 'barcode', 'upload', 'download',
+  'check', 'warning', 'plus', 'arrow-up', 'chevron-right',
+  'type-number', 'type-boolean', 'type-null', 'type-color', 'type-file', 'type-video',
+  'type-date', 'type-time', 'type-datetime', 'type-image'
+])
+app.component('icon', {
+  props: { name: { type: String, required: true } },
+  computed: {
+    iconClass() {
+      return FILLED_ICONS.has(this.name) ? 'icon icon-filled' : 'icon icon-stroke'
+    }
+  },
+  template: '<svg :class="iconClass" aria-hidden="true" focusable="false"><use :href="`#i-${name}`" /></svg>'
+})
+
+app.mount('#app')

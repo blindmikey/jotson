@@ -48,6 +48,24 @@ body.light {
 * { box-sizing: border-box; margin: 0; padding: 0; }
 [v-cloak] { display: none; }
 
+/* Monochrome SVG icons: inherit text color via currentColor, sized to the font */
+.icon {
+  width: 1.1em;
+  height: 1.1em;
+  display: inline-block;
+  vertical-align: -0.18em;
+  flex: none;
+}
+.icon-filled { fill: currentColor; stroke: none; }
+.icon-stroke {
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.9;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+button .icon { pointer-events: none; }
+
 /* Minimal, theme-colored scrollbars (standard properties; supported in Chrome 121+/Firefox) */
 * { scrollbar-width: thin; scrollbar-color: var(--sb-thumb) transparent; }
 
@@ -144,7 +162,10 @@ code { font-family: var(--mono); font-size: 0.85em; }
 .btn.ghost:disabled { opacity: 0.4; cursor: default; }
 .btn.update-pill { color: var(--green); border-color: var(--green); }
 .btn.update-pill:hover:not(:disabled) { color: var(--green); background: var(--bg-hover); }
-.btn.save { background: var(--accent); color: #fff; font-weight: 600; }
+/* Primary action fill uses the vibrant brand purple (--indigo) so it pops in dark mode;
+   the muted --accent stays for subtle surfaces (selected-cell tip, menu hovers, tab outline).
+   In light mode --indigo and --accent are the same value, so this changes only dark. */
+.btn.save { background: var(--indigo); color: #fff; font-weight: 600; }
 .btn.save:hover:not(:disabled) { filter: brightness(1.15); }
 .btn.save:disabled { background: var(--bg-raised); color: var(--text-faint); cursor: default; }
 .btn.tiny { padding: 0.1rem 0.45rem; font-size: 0.7rem; }
@@ -189,7 +210,9 @@ code { font-family: var(--mono); font-size: 0.85em; }
 .gear-scope.active { border-color: var(--text-faint); }
 .gear-scope.active.has { border-color: var(--green); }
 .gear-btn {
-  padding: 0.15rem 0.4rem;
+  display: inline-flex;
+  align-items: center;
+  padding: 0.25rem 0.4rem;
   font-size: 0.9rem;
   line-height: 1;
   color: var(--text-faint);
@@ -323,20 +346,24 @@ code { font-family: var(--mono); font-size: 0.85em; }
   font-family: var(--mono);
   font-size: 0.62rem;
   width: 1.7rem;
+  height: 1.25rem;
   flex-shrink: 0;
-  text-align: center;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   border-radius: 4px;
-  padding: 0.1rem 0;
 }
+.cell-type .icon { width: 0.95rem; height: 0.95rem; vertical-align: 0; stroke-width: 2; }
+.cell-type .type-text { font-family: var(--mono); font-size: 0.66rem; letter-spacing: 0.12em; padding-left: 0.12em; }
 .t-string { color: var(--green); background: rgba(63, 178, 127, 0.12); }
 .t-number { color: var(--cyan); background: rgba(76, 195, 217, 0.12); }
 .t-boolean { color: var(--purple); background: rgba(176, 124, 240, 0.12); }
 .t-null { color: var(--text-faint); background: rgba(140, 147, 167, 0.12); }
 .t-object { color: var(--indigo); background: rgba(109, 120, 242, 0.12); }
 .t-array { color: var(--amber); background: rgba(224, 168, 60, 0.12); }
-.t-date, .t-datetime { color: #f082b0; background: rgba(240, 130, 176, 0.12); font-size: 0.58rem; }
+.t-date, .t-time, .t-datetime { color: #f082b0; background: rgba(240, 130, 176, 0.12); font-size: 0.58rem; }
 .t-color { color: var(--amber); background: rgba(224, 168, 60, 0.12); font-size: 0.58rem; }
-.t-file { color: var(--cyan); background: rgba(76, 195, 217, 0.12); font-size: 0.58rem; }
+.t-file, .t-video { color: var(--cyan); background: rgba(76, 195, 217, 0.12); font-size: 0.58rem; }
 .t-reference { color: var(--indigo); background: rgba(109, 120, 242, 0.12); font-size: 0.58rem; }
 
 .cell-key {
@@ -449,6 +476,19 @@ body.resizing .columns { scroll-behavior: auto; }
 .ref-target .ref-loc { color: var(--text-faint); font-size: 0.72rem; font-family: var(--mono); flex: 1; white-space: normal; word-break: break-word; }
 .ref-target .ref-go { color: var(--indigo); flex-shrink: 0; }
 .ref-backlinks { display: flex; flex-direction: column; gap: 0.3rem; }
+/* Cap the backlink list at ~4.5 rows (each ~35px + 5px gap) so a heavily-referenced
+   object doesn't push the panel forever, with a half row hinting there's more.
+   translateZ(0) + padding work around a Chrome bug where child borders smear on
+   hover-repaint after the container is scrolled. */
+.ref-backlinks-scroll {
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  max-height: 11rem;
+  overflow-y: auto;
+  padding: 1px;
+  transform: translateZ(0);
+}
 
 /* Type row key/item count + inline object fields */
 .type-count { margin-left: auto; color: var(--text-faint); font-size: 0.78rem; }
@@ -471,12 +511,13 @@ body.resizing .columns { scroll-behavior: auto; }
 .of-key:hover .of-name { color: var(--text); text-decoration: underline; }
 .of-value { display: flex; align-items: flex-start; gap: 0.5rem; }
 .of-input { flex: 1; width: 100%; font-size: 0.8rem; }
+/* Multi-line text in the fields overview shows ~4.5 rows, then scrolls (still drag-resizable) */
+textarea.of-input { line-height: 1.4; height: calc(1.4em * 4.5 + 0.9rem + 2px); resize: vertical; overflow-y: auto; }
 /* Compound editors (color/file) reused from the main inspector, scaled to overview rows */
 .of-typed { flex: 1; min-width: 0; gap: 0.35rem; }
 .of-ref { display: flex; align-items: center; }
 .of-title { display: flex; align-items: center; justify-content: space-between; }
 .of-ref .of-container { flex: 1; min-width: 0; }
-.of-link a { min-width: 0; }
 .of-typed input[type='color'] { width: 2.4rem; height: 1.85rem; }
 .of-typed .btn.op { padding: 0.25rem 0.5rem; font-size: 0.8rem; }
 .of-swatch { width: 1.5rem; height: 1.5rem; border-radius: 4px; border: 1px solid var(--border); flex-shrink: 0; }
@@ -514,7 +555,8 @@ body.resizing .columns { scroll-behavior: auto; }
 .ref-collection .count { color: var(--text-faint); }
 .ref-back { align-self: flex-start; margin: 0.4rem 0 0 0.6rem; }
 
-.orphan-list { margin-top: 0.5rem; border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; max-height: 180px; overflow-y: auto; }
+.orphan-list { margin-top: 0.5rem; border: 1px solid var(--border); border-radius: 6px; padding: 0.5rem; }
+.orphan-scroll { max-height: 45vh; overflow-y: auto; }
 .orphan-row { display: flex; justify-content: space-between; gap: 0.75rem; font-family: var(--mono); font-size: 0.72rem; color: var(--text-dim); padding: 0.15rem 0; }
 .orphan-row .orphan-size { color: var(--text-faint); flex-shrink: 0; }
 .orphan-list .op-group { margin-top: 0.5rem; }
@@ -557,11 +599,6 @@ body.resizing .columns { scroll-behavior: auto; }
 .spf-label { font-size: 0.68rem; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.04em; flex-shrink: 0; width: 7.2rem; }
 .spf-value { font-family: var(--mono); font-size: 0.76rem; color: var(--text-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .sp-format:hover .spf-value { color: var(--text); }
-.sp-url { display: flex; align-items: center; gap: 0.5rem; min-width: 0; }
-.sp-url a { color: var(--cyan); font-size: 0.8rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.badge { font-size: 0.64rem; padding: 0.1rem 0.4rem; border-radius: 999px; flex-shrink: 0; text-transform: uppercase; letter-spacing: 0.04em; }
-.badge.internal { background: rgba(109, 120, 242, 0.18); color: var(--indigo); }
-.badge.external { background: rgba(224, 168, 60, 0.18); color: var(--amber); }
 /* Single breaks stay tight (pre-line inside each paragraph); blank lines become
    paragraph gaps, so one break vs two reads unmistakably different */
 .sp-multiline { font-size: 0.82rem; color: var(--text-dim); max-height: 28vh; overflow-y: auto; }
@@ -598,6 +635,8 @@ body.resizing .columns { scroll-behavior: auto; }
 .confirm-scrim { z-index: 100; }
 .confirm-modal { max-width: 420px; }
 .confirm-body { padding: 1.1rem 1.2rem; font-size: 0.9rem; line-height: 1.5; white-space: pre-line; }
+.confirm-warn { display: flex; align-items: center; gap: 0.45rem; margin-top: 0.8rem; color: var(--amber); white-space: normal; }
+.confirm-warn .icon { flex: none; }
 .confirm-body p { margin: 0 0 0.6rem; }
 .confirm-body .hint { white-space: normal; }
 .fill-keys { margin: 0 0 0.7rem; padding-left: 1.2rem; display: flex; flex-direction: column; gap: 0.2rem; }
