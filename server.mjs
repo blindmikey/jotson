@@ -276,7 +276,11 @@ async function unfurl(target) {
       headers: {
         // Some sites only serve OpenGraph tags to browser-like agents
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
-        Accept: 'text/html,application/xhtml+xml'
+        Accept: 'text/html,application/xhtml+xml',
+        // Request undecompressed bodies: we only read HTML meta tags, so there's
+        // nothing to gain from compression, and it keeps untrusted pages out of
+        // the runtime's gzip/brotli decoders (e.g. the Brotli OOB-write class).
+        'Accept-Encoding': 'identity'
       }
     })
     const html = (await resp.text()).slice(0, 500000)

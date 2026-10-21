@@ -63,7 +63,7 @@ Copy this `jotson/` folder into any project, then:
 node jotson/server.mjs
 ```
 
-### Requirements: Node 18+. Nothing else.
+### Requirements: Node 22+. Nothing else.
 
 There are no npm dependencies, the server uses only
 Node built-ins (including global `fetch` for link previews), and the UI runs on a vendored copy of
